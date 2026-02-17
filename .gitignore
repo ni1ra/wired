@@ -1,0 +1,31 @@
+# Build artifacts
+/target
+
+# Model checkpoints (large binary files)
+*.safetensors
+*.bin
+*.ckpt
+
+# Training outputs
+gallery_*.txt
+full_pipeline_*.txt
+
+# Data artifacts (keep brain_corpus.json, exclude generated)
+data/*.txt
+data/*.jsonl
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# AI tooling context files (subdirectory only)
+src/CLAUDE.md
+data/CLAUDE.md
+tests/CLAUDE.md
