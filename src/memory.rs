@@ -126,6 +126,33 @@ impl EpisodicMemory {
         Ok(records.into_iter().map(|r| r.concept_vec).collect())
     }
 
+    /// Retrieve the N most recent memories (by insertion order).
+    /// Used for bulk loading into in-memory MemoryBank on startup (T-021).
+    pub fn retrieve_recent(&self, n: usize) -> Result<Vec<MemoryRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp, concept_vec, goal, response, success
+             FROM episodes ORDER BY id DESC LIMIT ?1"
+        )?;
+
+        let records: Vec<MemoryRecord> = stmt.query_map(params![n as i64], |row| {
+            let id: i64 = row.get(0)?;
+            let timestamp: String = row.get(1)?;
+            let blob: Vec<u8> = row.get(2)?;
+            let goal: String = row.get(3)?;
+            let response: String = row.get(4)?;
+            let success: i32 = row.get(5)?;
+            Ok((id, timestamp, blob, goal, response, success != 0))
+        })?
+        .filter_map(|r| r.ok())
+        .map(|(id, timestamp, blob, goal, response, success)| {
+            let concept_vec = blob_to_vec(&blob);
+            MemoryRecord { id, goal, response, success, concept_vec, timestamp }
+        })
+        .collect();
+
+        Ok(records)
+    }
+
     /// Number of stored episodes.
     pub fn len(&self) -> Result<usize> {
         let count: i64 = self.conn.query_row(
@@ -334,6 +361,25 @@ mod tests {
 
         let results = mem.retrieve_top_k(&[0.0, 1.0, 0.0], 1)?;
         assert!(!results[0].success);
+        Ok(())
+    }
+
+    #[test]
+    fn test_retrieve_recent() -> Result<()> {
+        let mem = test_mem(100);
+        mem.store(&[1.0, 0.0, 0.0], "first", "r1", true)?;
+        mem.store(&[0.0, 1.0, 0.0], "second", "r2", true)?;
+        mem.store(&[0.0, 0.0, 1.0], "third", "r3", true)?;
+
+        // Most recent first
+        let recent = mem.retrieve_recent(2)?;
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].goal, "third");  // most recent
+        assert_eq!(recent[1].goal, "second"); // second most recent
+
+        // Request more than available
+        let all = mem.retrieve_recent(100)?;
+        assert_eq!(all.len(), 3);
         Ok(())
     }
 }

@@ -17,6 +17,7 @@ use crate::brain::{
     ACT_REPO_READ, ACT_FIX_TESTS, ACT_LEAN_SUITE,
 };
 use crate::executor::{Executor, ToolArgs, ToolOutput};
+use crate::tokenizer::ConceptTokenizer;
 use anyhow::Result;
 use candle_core::{Device, Tensor};
 use std::path::PathBuf;
@@ -199,7 +200,7 @@ fn extract_path(context: &str) -> &str {
 /// This is the testable core — tests can supply known actions directly.
 pub fn run_with_plan(
     brain: &Brain, goal: &str, intent: usize, actions: &[usize; PLAN_STEPS],
-    config: &PipelineConfig, device: &Device,
+    config: &PipelineConfig, decoder_tok: &ConceptTokenizer, device: &Device,
 ) -> Result<ExecutionResult> {
     let executor = Executor::new(
         config.work_dir.clone(), config.allow_writes, config.timeout,
@@ -220,7 +221,7 @@ pub fn run_with_plan(
         if action == ACT_TALK {
             let response = brain_generate(
                 brain, &context, config.max_tokens, config.temperature,
-                false, device,
+                false, decoder_tok, device,
             ).unwrap_or_else(|_| "(generation failed)".to_string());
 
             steps.push(StepResult {
@@ -306,10 +307,11 @@ pub fn run_with_plan(
 
 /// Full pipeline: classify goal with brain, then execute the resulting plan.
 pub fn run_goal(
-    brain: &Brain, goal: &str, config: &PipelineConfig, device: &Device,
+    brain: &Brain, goal: &str, config: &PipelineConfig,
+    decoder_tok: &ConceptTokenizer, device: &Device,
 ) -> Result<ExecutionResult> {
     let (intent, actions) = classify_goal(brain, goal, device)?;
-    run_with_plan(brain, goal, intent, &actions, config, device)
+    run_with_plan(brain, goal, intent, &actions, config, decoder_tok, device)
 }
 
 #[cfg(test)]
@@ -321,13 +323,13 @@ mod tests {
     };
     use candle_nn::VarMap;
 
-    fn test_brain() -> (Brain, Device) {
+    fn test_brain() -> (Brain, ConceptTokenizer, Device) {
         let device = Device::Cpu;
         let config = BrainConfig::test_brain();
         let policy_cfg = PolicyConfig::test();
         let varmap = VarMap::new();
         let brain = Brain::new(config, &policy_cfg, &varmap, &device).unwrap();
-        (brain, device)
+        (brain, ConceptTokenizer::new(), device)
     }
 
     fn test_config() -> PipelineConfig {
@@ -338,11 +340,11 @@ mod tests {
 
     #[test]
     fn test_run_goal_hello() {
-        let (brain, device) = test_brain();
+        let (brain, dtok, device) = test_brain();
         let config = test_config();
         // Explicit conversational plan — no tool execution
         let actions = [ACT_TALK, ACT_END, ACT_END, ACT_END, ACT_END, ACT_END];
-        let result = run_with_plan(&brain, "hello", 0, &actions, &config, &device).unwrap();
+        let result = run_with_plan(&brain, "hello", 0, &actions, &config, &dtok, &device).unwrap();
         assert_eq!(result.steps.len(), 1);
         assert_eq!(result.steps[0].action, ACT_TALK);
         assert!(result.steps[0].response.is_some());
@@ -352,12 +354,12 @@ mod tests {
 
     #[test]
     fn test_run_goal_cargo_check() {
-        let (brain, device) = test_brain();
+        let (brain, dtok, device) = test_brain();
         let config = test_config();
         // Tool execution: cargo check (faster than cargo test, avoids recursion)
         let actions = [ACT_CARGO_CHECK, ACT_END, ACT_END, ACT_END, ACT_END, ACT_END];
         let result = run_with_plan(
-            &brain, "check code", 2, &actions, &config, &device,
+            &brain, "check code", 2, &actions, &config, &dtok, &device,
         ).unwrap();
         assert_eq!(result.steps.len(), 1);
         assert_eq!(result.steps[0].action_name, "cargo_check");
@@ -367,12 +369,12 @@ mod tests {
 
     #[test]
     fn test_run_goal_composite() {
-        let (brain, device) = test_brain();
+        let (brain, dtok, device) = test_brain();
         let config = test_config();
         // Multi-step: read Cargo.toml → chain output to memory_search
         let actions = [ACT_REPO_READ, ACT_MEMORY_SEARCH, ACT_END, ACT_END, ACT_END, ACT_END];
         let result = run_with_plan(
-            &brain, "Cargo.toml", 3, &actions, &config, &device,
+            &brain, "Cargo.toml", 3, &actions, &config, &dtok, &device,
         ).unwrap();
         assert_eq!(result.steps.len(), 2);
         assert!(result.steps[0].success); // repo_read succeeded
@@ -382,12 +384,12 @@ mod tests {
 
     #[test]
     fn test_run_goal_failure() {
-        let (brain, device) = test_brain();
+        let (brain, dtok, device) = test_brain();
         let config = test_config();
         // repo_read with nonexistent file → error → pipeline stops
         let actions = [ACT_REPO_READ, ACT_CARGO_CHECK, ACT_END, ACT_END, ACT_END, ACT_END];
         let result = run_with_plan(
-            &brain, "/nonexistent/file.txt", 4, &actions, &config, &device,
+            &brain, "/nonexistent/file.txt", 4, &actions, &config, &dtok, &device,
         ).unwrap();
         assert!(!result.success);
         assert_eq!(result.steps.len(), 1); // Stopped after first failure
@@ -396,7 +398,7 @@ mod tests {
 
     #[test]
     fn test_classify_goal_returns_valid() {
-        let (brain, device) = test_brain();
+        let (brain, _dtok, device) = test_brain();
         let (intent, actions) = classify_goal(&brain, "hello", &device).unwrap();
         assert!(intent < NUM_INTENTS);
         for &a in &actions {
@@ -424,9 +426,9 @@ mod tests {
     #[test]
     fn test_run_goal_full_pipeline() {
         // Full pipeline: brain classifies (untrained → random), then executes
-        let (brain, device) = test_brain();
+        let (brain, dtok, device) = test_brain();
         let config = test_config();
-        let result = run_goal(&brain, "hello", &config, &device).unwrap();
+        let result = run_goal(&brain, "hello", &config, &dtok, &device).unwrap();
         // Untrained brain → random intent, but pipeline should not crash
         assert!(result.intent < NUM_INTENTS);
         assert!(!result.goal.is_empty());

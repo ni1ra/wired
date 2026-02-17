@@ -10,14 +10,15 @@
 // GPU: auto-detected when compiled with --features cuda and tier is not "test"
 
 use gestalt::brain::{
-    Brain, BrainConfig, PolicyConfig,
+    Brain, BrainConfig, PolicyConfig, TalkTokenizer,
     train_brain_talk, brain_generate, train_and_bench,
-    bootstrap_concept_tokenizer,
+    bootstrap_concept_tokenizer, build_concept_tokenizer,
 };
 use gestalt::eval::score_plan_bench;
 use gestalt::pipeline::{run_goal, PipelineConfig};
 use gestalt::planner::{PlanLmConfig, train_sft, greedy_decode};
-use gestalt::tokenizer::PlanTokenizer;
+use gestalt::tokenizer::{PlanTokenizer, ConceptTokenizer};
+use gestalt::memory::EpisodicMemory;
 use gestalt::training::{save_checkpoint, load_checkpoint};
 
 use candle_core::Device;
@@ -185,6 +186,27 @@ fn print_usage() {
     eprintln!("  phase2   d=1024, 8 layers, auto-GPU (~200M params)");
 }
 
+/// Load ConceptTokenizer from file, or return byte-level (no merges) for test tier.
+fn load_or_build_decoder_tok(tier: ConfigTier) -> ConceptTokenizer {
+    let tok_path = "concept_tokenizer.bin";
+    if tier == ConfigTier::Test {
+        return ConceptTokenizer::new(); // byte-level for tests
+    }
+    if let Ok(data) = std::fs::read(tok_path) {
+        match ConceptTokenizer::load_merges(&data) {
+            Ok(tok) => {
+                eprintln!("[GESTALT] Loaded ConceptTokenizer from {} ({} vocab, {} merges)",
+                    tok_path, tok.vocab_size(), tok.num_merges());
+                return tok;
+            }
+            Err(e) => eprintln!("[GESTALT] Failed to load {}: {}", tok_path, e),
+        }
+    }
+    eprintln!("[GESTALT] No saved tokenizer found, building from corpus...");
+    let max_merges = if tier == ConfigTier::Phase2 { 8000 } else { 2000 };
+    build_concept_tokenizer(max_merges, 3)
+}
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
@@ -196,7 +218,9 @@ fn cmd_run(args: &[String], tier: ConfigTier) -> anyhow::Result<()> {
     let goal = args.join(" ");
     let device = select_device(tier);
 
-    let config = tier.brain_config();
+    let decoder_tok = load_or_build_decoder_tok(tier);
+    let mut config = tier.brain_config();
+    config.decoder_vocab_size = decoder_tok.vocab_size();
     let policy_cfg = tier.policy_config();
     let varmap = VarMap::new();
     let brain = Brain::new(config, &policy_cfg, &varmap, &device)?;
@@ -210,7 +234,7 @@ fn cmd_run(args: &[String], tier: ConfigTier) -> anyhow::Result<()> {
     }
 
     let pipeline_config = PipelineConfig::default_config(std::env::current_dir()?);
-    let result = run_goal(&brain, &goal, &pipeline_config, &device)?;
+    let result = run_goal(&brain, &goal, &pipeline_config, &decoder_tok, &device)?;
 
     println!("Intent: {} | Steps: {} | Success: {}",
         result.intent, result.steps.len(), result.success);
@@ -239,6 +263,27 @@ fn cmd_train(tier: ConfigTier, resume: bool) -> anyhow::Result<()> {
         plan_cfg.sft_steps, plan_cfg.scheduled_sampling_steps, plan_cfg.d_model);
     eprintln!("[GESTALT] Policy: {} steps (d={})", policy_cfg.steps, policy_cfg.d_model);
 
+    // v17: Build ConceptTokenizer BEFORE brain training so decoder uses concept-level vocab.
+    // For test tier: byte-level (no merges). For production: build from corpus (2000+ merges).
+    let decoder_tok = if tier == ConfigTier::Test {
+        ConceptTokenizer::new() // byte-level, vocab=259
+    } else {
+        let max_merges = if tier == ConfigTier::Phase2 { 8000 } else { 2000 };
+        build_concept_tokenizer(max_merges, 3)
+    };
+    eprintln!("[GESTALT] Decoder vocab: {} tokens ({} merges)",
+        decoder_tok.vocab_size(), decoder_tok.num_merges());
+
+    // Show compression stats
+    if decoder_tok.num_merges() > 0 {
+        for sample in &["hello", "search jarviscmd", "what can you do"] {
+            let ratio = decoder_tok.compression_ratio(sample);
+            let ids = decoder_tok.encode(sample);
+            eprintln!("[GESTALT] \"{}\" -> {} tokens (compression {:.2}x)",
+                sample, ids.len() - 2, ratio);
+        }
+    }
+
     let temperature = config.temperature;
     let (brain, _brain_varmap) = if resume {
         // Resume: load brain from best SFT checkpoint, skip training
@@ -246,15 +291,18 @@ fn cmd_train(tier: ConfigTier, resume: bool) -> anyhow::Result<()> {
         eprintln!("\n[GESTALT] === Resuming from {} ===", ckpt);
         anyhow::ensure!(std::path::Path::new(ckpt).exists(),
             "Cannot resume: {} not found", ckpt);
+        // v17: set decoder_vocab_size for model construction
+        let mut resume_config = config.clone();
+        resume_config.decoder_vocab_size = decoder_tok.vocab_size();
         let varmap = VarMap::new();
-        let brain = Brain::new(config, &policy_cfg, &varmap, &device)?;
+        let brain = Brain::new(resume_config, &policy_cfg, &varmap, &device)?;
         load_checkpoint(&varmap, ckpt, &device)?;
         eprintln!("[GESTALT] Brain loaded from checkpoint");
         (brain, varmap)
     } else {
         // Phase 1: Brain (SFT + dialogue-aligned finetuning)
         eprintln!("\n[GESTALT] === Training brain (SFT + DA) ===");
-        let (brain, brain_varmap, losses) = train_brain_talk(&config, &policy_cfg, &device)?;
+        let (brain, brain_varmap, losses) = train_brain_talk(&config, &policy_cfg, &decoder_tok, &device)?;
         let final_loss = losses.last().copied().unwrap_or(f32::NAN);
         eprintln!("[GESTALT] Brain done. Final loss: {:.4}", final_loss);
 
@@ -265,26 +313,18 @@ fn cmd_train(tier: ConfigTier, resume: bool) -> anyhow::Result<()> {
         (brain, brain_varmap)
     };
 
-    // Concept tokenizer bootstrap (T-014) — uses trained encoder
+    // Save concept tokenizer (v17: always save after training for gallery/resume)
     if tier != ConfigTier::Test {
-        eprintln!("\n[GESTALT] === Bootstrapping concept tokenizer (T-014) ===");
-        let max_merges = if tier == ConfigTier::Phase2 { 8000 } else { 2000 };
-        let concept_tok = bootstrap_concept_tokenizer(&brain, max_merges, 3, &device)?;
-
-        // Save tokenizer
         let tok_path = std::path::Path::new("concept_tokenizer.bin");
-        let tok_data = concept_tok.save_merges();
+        let tok_data = decoder_tok.save_merges();
         std::fs::write(tok_path, &tok_data)?;
-        eprintln!("[GESTALT] Saved concept tokenizer to {:?} ({} bytes)",
-            tok_path, tok_data.len());
+        eprintln!("[GESTALT] Saved concept tokenizer to {:?} ({} bytes, {} vocab)",
+            tok_path, tok_data.len(), decoder_tok.vocab_size());
 
-        // Show compression stats on a few sample inputs
-        for sample in &["hello", "search jarviscmd", "what can you do"] {
-            let ratio = concept_tok.compression_ratio(sample);
-            let ids = concept_tok.encode(sample);
-            eprintln!("[GESTALT] \"{}\" -> {} tokens (compression {:.2}x)",
-                sample, ids.len() - 2, ratio); // -2 for BOS/EOS
-        }
+        // Also re-bootstrap from trained encoder for comparison (optional diagnostic)
+        eprintln!("\n[GESTALT] === Bootstrapping concept tokenizer from encoder (T-014, diagnostic) ===");
+        let max_merges = if tier == ConfigTier::Phase2 { 8000 } else { 2000 };
+        let _encoder_tok = bootstrap_concept_tokenizer(&brain, max_merges, 3, &device)?;
     }
 
     // Planner (SFT)
@@ -308,18 +348,18 @@ fn cmd_train(tier: ConfigTier, resume: bool) -> anyhow::Result<()> {
     let max_gen = if tier == ConfigTier::Test { 64 } else { 128 };
 
     // Greedy first (true model quality indicator)
-    let r_greedy = brain_generate(&brain, "hello", max_gen, 0.0, false, &device)?;
+    let r_greedy = brain_generate(&brain, "hello", max_gen, 0.0, false, &decoder_tok, &device)?;
     eprintln!("[GESTALT] \"hello\" (greedy) -> \"{}\"", r_greedy);
 
-    let r_greedy2 = brain_generate(&brain, "what can you do", max_gen, 0.0, false, &device)?;
+    let r_greedy2 = brain_generate(&brain, "what can you do", max_gen, 0.0, false, &decoder_tok, &device)?;
     eprintln!("[GESTALT] \"what can you do\" (greedy) -> \"{}\"", r_greedy2);
 
     // Sampled
     let temp = if tier == ConfigTier::Test { 0.8 } else { temperature };
-    let response = brain_generate(&brain, "hello", max_gen, temp, false, &device)?;
+    let response = brain_generate(&brain, "hello", max_gen, temp, false, &decoder_tok, &device)?;
     eprintln!("[GESTALT] \"hello\" (temp={:.1}) -> \"{}\"", temp, response);
 
-    let response2 = brain_generate(&brain, "what can you do", max_gen, temp, false, &device)?;
+    let response2 = brain_generate(&brain, "what can you do", max_gen, temp, false, &decoder_tok, &device)?;
     eprintln!("[GESTALT] \"what can you do\" (temp={:.1}) -> \"{}\"", temp, response2);
 
     // Comprehensive generation gallery (v14+)
@@ -399,7 +439,7 @@ fn cmd_train(tier: ConfigTier, resume: bool) -> anyhow::Result<()> {
         for (category, prompts) in &gallery_prompts {
             eprintln!("\n[GALLERY] --- {} ---", category);
             for prompt in prompts {
-                let gen = brain_generate(&brain, prompt, max_gen, 0.0, false, &device)?;
+                let gen = brain_generate(&brain, prompt, max_gen, 0.0, false, &decoder_tok, &device)?;
                 eprintln!("[GALLERY] \"{}\" -> \"{}\"", prompt, gen);
             }
         }
@@ -414,8 +454,14 @@ fn cmd_gallery(tier: ConfigTier) -> anyhow::Result<()> {
     let device = select_device(tier);
     let config = tier.brain_config();
     let policy_cfg = tier.policy_config();
+
+    // v17: Load ConceptTokenizer for decoder vocab
+    let decoder_tok = load_or_build_decoder_tok(tier);
+    let mut gallery_config = config.clone();
+    gallery_config.decoder_vocab_size = decoder_tok.vocab_size();
+
     let varmap = VarMap::new();
-    let brain = Brain::new(config, &policy_cfg, &varmap, &device)?;
+    let brain = Brain::new(gallery_config, &policy_cfg, &varmap, &device)?;
 
     let ckpt = "brain_checkpoint.safetensors";
     if std::path::Path::new(ckpt).exists() {
@@ -601,7 +647,7 @@ fn cmd_gallery(tier: ConfigTier) -> anyhow::Result<()> {
     for (category, prompts) in &gallery_prompts {
         eprintln!("\n[GALLERY] --- {} ---", category);
         for prompt in prompts {
-            let gen = brain_generate(&brain, prompt, max_gen, 0.0, false, &device)?;
+            let gen = brain_generate(&brain, prompt, max_gen, 0.0, false, &decoder_tok, &device)?;
             eprintln!("[GALLERY] \"{}\" -> \"{}\"", prompt, gen);
             total += 1;
         }
@@ -611,7 +657,7 @@ fn cmd_gallery(tier: ConfigTier) -> anyhow::Result<()> {
     eprintln!("\n[GALLERY] --- Sampled (temp=0.5) ---");
     for prompt in &["hello", "What is beauty?", "Tell me a joke", "What is consciousness?",
                      "I'm tired", "What is the meaning of life?"] {
-        let gen = brain_generate(&brain, prompt, max_gen, 0.5, false, &device)?;
+        let gen = brain_generate(&brain, prompt, max_gen, 0.5, false, &decoder_tok, &device)?;
         eprintln!("[GALLERY] \"{}\" (t=0.5) -> \"{}\"", prompt, gen);
         total += 1;
     }
@@ -619,14 +665,14 @@ fn cmd_gallery(tier: ConfigTier) -> anyhow::Result<()> {
     eprintln!("\n[GALLERY] --- Sampled (temp=0.7) ---");
     for prompt in &["hello", "tell me a joke", "What is beauty?", "convince me to learn Rust",
                      "Are you alive?", "Say something beautiful", "Roast me"] {
-        let gen = brain_generate(&brain, prompt, max_gen, 0.7, false, &device)?;
+        let gen = brain_generate(&brain, prompt, max_gen, 0.7, false, &decoder_tok, &device)?;
         eprintln!("[GALLERY] \"{}\" (t=0.7) -> \"{}\"", prompt, gen);
         total += 1;
     }
 
     eprintln!("\n[GALLERY] --- Sampled (temp=1.0) ---");
     for prompt in &["hello", "tell me a joke", "What is truth?", "Do you dream?"] {
-        let gen = brain_generate(&brain, prompt, max_gen, 1.0, false, &device)?;
+        let gen = brain_generate(&brain, prompt, max_gen, 1.0, false, &decoder_tok, &device)?;
         eprintln!("[GALLERY] \"{}\" (t=1.0) -> \"{}\"", prompt, gen);
         total += 1;
     }
@@ -658,10 +704,12 @@ fn cmd_eval(tier: ConfigTier) -> anyhow::Result<()> {
 
 fn cmd_serve(tier: ConfigTier) -> anyhow::Result<()> {
     let device = select_device(tier);
-    let config = tier.brain_config();
+    let decoder_tok = load_or_build_decoder_tok(tier);
+    let mut config = tier.brain_config();
+    config.decoder_vocab_size = decoder_tok.vocab_size();
     let policy_cfg = tier.policy_config();
     let varmap = VarMap::new();
-    let brain = Brain::new(config, &policy_cfg, &varmap, &device)?;
+    let mut brain = Brain::new(config.clone(), &policy_cfg, &varmap, &device)?;
 
     // Load checkpoint if available
     let ckpt = "brain_checkpoint.safetensors";
@@ -669,6 +717,19 @@ fn cmd_serve(tier: ConfigTier) -> anyhow::Result<()> {
         load_checkpoint(&varmap, ckpt, &device)?;
     } else {
         eprintln!("[GESTALT] No checkpoint found, using untrained brain");
+    }
+
+    // T-021: Load episodic memories from SQLite for cross-session persistence.
+    let mem_db_path = "episodic_memory.db";
+    let episodic = EpisodicMemory::open(mem_db_path, config.d_model, config.memory_capacity)?;
+    let stored = episodic.len()?;
+    if stored > 0 {
+        let records = episodic.retrieve_recent(config.memory_capacity)?;
+        let memories: Vec<(Vec<f32>, String)> = records.into_iter()
+            .map(|r| (r.concept_vec, r.response))
+            .collect();
+        brain.load_memories(&memories);
+        eprintln!("[GESTALT] Loaded {} episodic memories from {}", memories.len(), mem_db_path);
     }
 
     let pipeline_config = PipelineConfig::default_config(std::env::current_dir()?);
@@ -682,8 +743,24 @@ fn cmd_serve(tier: ConfigTier) -> anyhow::Result<()> {
             break;
         }
 
-        match run_goal(&brain, trimmed, &pipeline_config, &device) {
+        match run_goal(&brain, trimmed, &pipeline_config, &decoder_tok, &device) {
             Ok(result) => {
+                // T-021: Store interaction in episodic memory for cross-session recall.
+                if !result.final_output.is_empty() {
+                    let enc_tok = TalkTokenizer;
+                    let goal_ids = enc_tok.encode(trimmed);
+                    let goal_padded = enc_tok.pad_or_truncate(&goal_ids, config.encoder_seq_len);
+                    if let Ok(goal_tensor) = candle_core::Tensor::from_vec(
+                        goal_padded, (1, config.encoder_seq_len), &device,
+                    ) {
+                        if let Ok(cv) = brain.encode_concept(&goal_tensor) {
+                            if let Ok(cv_vec) = cv.squeeze(0).and_then(|t| t.to_vec1::<f32>()) {
+                                let _ = episodic.store(&cv_vec, trimmed, &result.final_output, result.success);
+                                brain.store_memory(cv_vec, result.final_output.clone());
+                            }
+                        }
+                    }
+                }
                 println!("{}", result.final_output);
                 io::stdout().flush()?;
             }

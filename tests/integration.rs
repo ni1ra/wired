@@ -8,21 +8,23 @@ use gestalt::brain::{
     ACT_TALK, ACT_END, ACT_CARGO_CHECK, ACT_REPO_READ, ACT_MEMORY_SEARCH,
     NUM_INTENTS,
 };
+use gestalt::memory::EpisodicMemory;
 use gestalt::pipeline::{
     run_goal, run_with_plan, classify_goal, action_name, PipelineConfig,
 };
+use gestalt::tokenizer::ConceptTokenizer;
 use candle_core::Device;
 use candle_nn::VarMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-fn create_test_brain() -> (Brain, Device) {
+fn create_test_brain() -> (Brain, ConceptTokenizer, Device) {
     let device = Device::Cpu;
     let config = BrainConfig::test_brain();
     let policy_cfg = PolicyConfig::test();
     let varmap = VarMap::new();
     let brain = Brain::new(config, &policy_cfg, &varmap, &device).unwrap();
-    (brain, device)
+    (brain, ConceptTokenizer::new(), device)
 }
 
 fn test_pipeline_config() -> PipelineConfig {
@@ -42,10 +44,10 @@ fn test_pipeline_config() -> PipelineConfig {
 #[test]
 fn test_hello_conversational() {
     // "hello" → TALK plan → greeting (no tool execution)
-    let (brain, device) = create_test_brain();
+    let (brain, dtok, device) = create_test_brain();
     let config = test_pipeline_config();
     let actions = [ACT_TALK, ACT_END, ACT_END, ACT_END, ACT_END, ACT_END];
-    let result = run_with_plan(&brain, "hello", 0, &actions, &config, &device).unwrap();
+    let result = run_with_plan(&brain, "hello", 0, &actions, &config, &dtok, &device).unwrap();
 
     assert_eq!(result.goal, "hello");
     assert_eq!(result.steps.len(), 1);
@@ -59,11 +61,11 @@ fn test_hello_conversational() {
 #[test]
 fn test_build_check_pipeline() {
     // "cargo check" → Executor → cargo check → results
-    let (brain, device) = create_test_brain();
+    let (brain, dtok, device) = create_test_brain();
     let config = test_pipeline_config();
     let actions = [ACT_CARGO_CHECK, ACT_END, ACT_END, ACT_END, ACT_END, ACT_END];
     let result = run_with_plan(
-        &brain, "cargo check", 2, &actions, &config, &device,
+        &brain, "cargo check", 2, &actions, &config, &dtok, &device,
     ).unwrap();
 
     assert_eq!(result.steps.len(), 1);
@@ -77,11 +79,11 @@ fn test_build_check_pipeline() {
 #[test]
 fn test_composite_search_then_read() {
     // "search and open" → repo_read Cargo.toml → chain to memory_search
-    let (brain, device) = create_test_brain();
+    let (brain, dtok, device) = create_test_brain();
     let config = test_pipeline_config();
     let actions = [ACT_REPO_READ, ACT_MEMORY_SEARCH, ACT_END, ACT_END, ACT_END, ACT_END];
     let result = run_with_plan(
-        &brain, "Cargo.toml", 3, &actions, &config, &device,
+        &brain, "Cargo.toml", 3, &actions, &config, &dtok, &device,
     ).unwrap();
 
     // Both steps should complete
@@ -106,9 +108,9 @@ fn test_composite_search_then_read() {
 #[test]
 fn test_full_pipeline_hello() {
     // Full end-to-end: brain classifies, then executes
-    let (brain, device) = create_test_brain();
+    let (brain, dtok, device) = create_test_brain();
     let config = test_pipeline_config();
-    let result = run_goal(&brain, "hello", &config, &device).unwrap();
+    let result = run_goal(&brain, "hello", &config, &dtok, &device).unwrap();
 
     // With untrained brain, classification is random but pipeline must not crash
     assert_eq!(result.goal, "hello");
@@ -118,7 +120,7 @@ fn test_full_pipeline_hello() {
 #[test]
 fn test_full_pipeline_classify() {
     // Verify classify_goal returns valid intent and actions
-    let (brain, device) = create_test_brain();
+    let (brain, _dtok, device) = create_test_brain();
     let (intent, actions) = classify_goal(&brain, "run cargo test", &device).unwrap();
     assert!(intent < NUM_INTENTS);
     for (i, &a) in actions.iter().enumerate() {
@@ -134,14 +136,126 @@ fn test_full_pipeline_classify() {
 #[test]
 fn test_pipeline_failure_stops_execution() {
     // Tool failure at step 0 prevents step 1 from running
-    let (brain, device) = create_test_brain();
+    let (brain, dtok, device) = create_test_brain();
     let config = test_pipeline_config();
     let actions = [ACT_REPO_READ, ACT_CARGO_CHECK, ACT_END, ACT_END, ACT_END, ACT_END];
     let result = run_with_plan(
-        &brain, "/nonexistent/path.rs", 4, &actions, &config, &device,
+        &brain, "/nonexistent/path.rs", 4, &actions, &config, &dtok, &device,
     ).unwrap();
 
     assert!(!result.success);
     assert_eq!(result.steps.len(), 1, "Should stop after first failure");
     assert!(!result.steps[0].success);
+}
+
+// ---------------------------------------------------------------------------
+// Cross-session memory recall (T-021)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cross_session_memory_recall() {
+    // Simulate: session 1 stores memories → process restart → session 2 loads them
+    let db_path = "/tmp/gestalt_test_cross_session.db";
+    let _ = std::fs::remove_file(db_path);
+
+    let d_model = BrainConfig::test_brain().d_model;
+
+    // --- Session 1: store memories ---
+    {
+        let device = Device::Cpu;
+        let config = BrainConfig::test_brain();
+        let policy_cfg = PolicyConfig::test();
+        let varmap = VarMap::new();
+        let mut brain = Brain::new(config, &policy_cfg, &varmap, &device).unwrap();
+
+        // Simulate two interactions
+        let cv1 = vec![1.0f32; d_model];
+        let cv2 = vec![0.0f32; d_model / 2]
+            .into_iter()
+            .chain(vec![1.0f32; d_model - d_model / 2])
+            .collect::<Vec<_>>();
+
+        brain.store_memory(cv1.clone(), "greeting response".into());
+        brain.store_memory(cv2.clone(), "code review response".into());
+        assert_eq!(brain.memory_count(), 2);
+
+        // Persist to SQLite (like cmd_serve does after each interaction)
+        let episodic = EpisodicMemory::open(db_path, d_model, 1000).unwrap();
+        episodic.store(&cv1, "hello", "greeting response", true).unwrap();
+        episodic.store(&cv2, "review my code", "code review response", true).unwrap();
+        assert_eq!(episodic.len().unwrap(), 2);
+
+        // Brain and episodic memory drop here (simulating process exit)
+    }
+
+    // --- Session 2: reload from SQLite ---
+    {
+        let device = Device::Cpu;
+        let config = BrainConfig::test_brain();
+        let policy_cfg = PolicyConfig::test();
+        let varmap = VarMap::new();
+        let mut brain = Brain::new(config, &policy_cfg, &varmap, &device).unwrap();
+
+        // Fresh brain has no memories
+        assert_eq!(brain.memory_count(), 0);
+
+        // Load from SQLite (like cmd_serve does on startup)
+        let episodic = EpisodicMemory::open(db_path, d_model, 1000).unwrap();
+        let records = episodic.retrieve_recent(100).unwrap();
+        assert_eq!(records.len(), 2);
+
+        let memories: Vec<(Vec<f32>, String)> = records
+            .into_iter()
+            .map(|r| (r.concept_vec, r.response))
+            .collect();
+        brain.load_memories(&memories);
+
+        // Verify memories restored
+        assert_eq!(brain.memory_count(), 2);
+
+        // Verify concept vectors survived the roundtrip
+        let vecs = brain.export_concept_vecs();
+        assert_eq!(vecs.len(), 2);
+
+        // The first loaded memory should have d_model dimensions
+        assert_eq!(vecs[0].len(), d_model);
+        assert_eq!(vecs[1].len(), d_model);
+    }
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[test]
+fn test_episodic_memory_consolidation_across_sessions() {
+    // Test that consolidation works on restored data
+    let db_path = "/tmp/gestalt_test_consolidation.db";
+    let _ = std::fs::remove_file(db_path);
+
+    let d_model = 3; // small for readability
+
+    // Session 1: store similar + different memories
+    {
+        let episodic = EpisodicMemory::open(db_path, d_model, 1000).unwrap();
+        episodic.store(&[1.0, 0.0, 0.0], "hello", "Hi!", true).unwrap();
+        episodic.store(&[0.99, 0.01, 0.0], "hey", "Hey!", true).unwrap();
+        episodic.store(&[0.0, 0.0, 1.0], "run tests", "Running...", true).unwrap();
+        assert_eq!(episodic.len().unwrap(), 3);
+    }
+
+    // Session 2: reopen and consolidate
+    {
+        let episodic = EpisodicMemory::open(db_path, d_model, 1000).unwrap();
+        assert_eq!(episodic.len().unwrap(), 3);
+
+        let removed = episodic.consolidate(0.95).unwrap();
+        assert_eq!(removed, 1); // "hello" merged into "hey"
+        assert_eq!(episodic.len().unwrap(), 2);
+
+        // "hey" (newer) survived, "hello" (older) removed
+        let all = episodic.retrieve_top_k(&[1.0, 0.0, 0.0], 10).unwrap();
+        assert!(all.iter().any(|r| r.goal == "hey"));
+        assert!(!all.iter().any(|r| r.goal == "hello"));
+    }
+
+    let _ = std::fs::remove_file(db_path);
 }
