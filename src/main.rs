@@ -203,7 +203,10 @@ fn load_or_build_decoder_tok(tier: ConfigTier) -> ConceptTokenizer {
         }
     }
     eprintln!("[GESTALT] No saved tokenizer found, building from corpus...");
-    let max_merges = if tier == ConfigTier::Phase2 { 8000 } else { 500 };
+    let default_merges = 200; // v22: merges=200 is optimal
+    let max_merges = std::env::var("GESTALT_MERGES")
+        .ok().and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default_merges);
     build_concept_tokenizer(max_merges, 3)
 }
 
@@ -263,6 +266,9 @@ fn cmd_train(tier: ConfigTier, resume: bool) -> anyhow::Result<()> {
     if let Ok(v) = std::env::var("GESTALT_SFT_STEPS") {
         if let Ok(s) = v.parse::<usize>() { config.sft_steps = s; }
     }
+    if let Ok(v) = std::env::var("GESTALT_ACCUM_STEPS") {
+        if let Ok(a) = v.parse::<usize>() { config.grad_accum_steps = a; }
+    }
 
     eprintln!("[GESTALT] Config: {:?} | d_model={} | enc_layers={} | dec_layers={}",
         tier, config.d_model, config.encoder_layers, config.decoder_layers);
@@ -277,7 +283,7 @@ fn cmd_train(tier: ConfigTier, resume: bool) -> anyhow::Result<()> {
     let decoder_tok = if tier == ConfigTier::Test {
         ConceptTokenizer::new() // byte-level, vocab=259
     } else {
-        let default_merges = if tier == ConfigTier::Phase2 { 8000 } else { 500 };
+        let default_merges = 200; // v22: merges=200 is optimal (459 vocab, ~2x compression)
         let max_merges = std::env::var("GESTALT_MERGES")
             .ok().and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(default_merges);

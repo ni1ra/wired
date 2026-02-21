@@ -137,6 +137,7 @@ pub struct BrainConfig {
     pub early_stop_patience: usize,
     pub decoder_vocab_size: usize, // v17: decoder embedding table size (259=byte-level, 2259=concept tokens)
     pub dropout: f64, // v20: dropout rate for decoder transformer (0.0 = disabled)
+    pub grad_accum_steps: usize, // v23: gradient accumulation steps (effective_batch = batch * accum)
 }
 
 impl BrainConfig {
@@ -165,6 +166,7 @@ impl BrainConfig {
             early_stop_patience: 5, // v20: stricter early stopping (was 10)
             decoder_vocab_size: TALK_VOCAB_SIZE, // default: byte-level (override with ConceptTokenizer vocab)
             dropout: 0.1, // v20: decoder dropout to prevent overfitting
+            grad_accum_steps: 1, // no accumulation at d=512 (batch=48 fits in VRAM)
         }
     }
 
@@ -202,15 +204,18 @@ impl BrainConfig {
             early_stop_patience: 3,
             decoder_vocab_size: TALK_VOCAB_SIZE,
             dropout: 0.0, // no dropout in test mode (fast, deterministic)
+            grad_accum_steps: 1,
         }
     }
 
-    /// Phase 2 config: d=1024, 8+8 layers, ~200M params.
+    /// Phase 2 config: d=1024, 4+8 layers, ~170M params.
     /// Designed for RTX 5070 Ti (16GB VRAM).
+    /// v22 findings applied: merges=200, dropout=0.1, stale_stop early stopping.
+    /// Encoder stays shallow (v12: depth-induced collapse at 4L init, sim=0.96).
     pub fn phase2() -> Self {
         Self {
             d_model: 1024,
-            encoder_layers: 8,
+            encoder_layers: 4,  // conservative: v12 showed collapse at depth, scale gradually
             decoder_layers: 8,
             n_heads: 8,
             d_ff: 4096,
@@ -220,18 +225,19 @@ impl BrainConfig {
             decoder_seq_len: 256,
             memory_capacity: 1024,
             sft_steps: 50000,
-            sft_lr: 3e-4,
-            sft_batch_size: 8,
-            temperature: 0.1,
-            da_steps: 16384,
+            sft_lr: 1e-4,       // v22: lower LR for larger model (was 3e-4)
+            sft_batch_size: 2,   // v23: batch=4 still OOMs — candle f32 memory overhead
+            temperature: 0.8,    // v22: match default (was 0.1)
+            da_steps: 0,         // v22: DA disabled until SFT quality proven
             da_lr: 1e-4,
             da_batch_size: 4,
             max_noise_rate: 0.10,
-            early_stop_sft: 1e-4,
+            early_stop_sft: 0.0, // v22: use stale_stop mode (M-039)
             early_stop_da: 5e-3,
             early_stop_patience: 5,
             decoder_vocab_size: TALK_VOCAB_SIZE,
             dropout: 0.1,
+            grad_accum_steps: 16, // v23: gradient accumulation for d=1024 (effective batch = 2 * 16 = 32)
         }
     }
 
@@ -918,22 +924,29 @@ pub fn train_brain_talk(
     // v14 trains the encoder directly — GradRmsNorm + grad_softmax_last_dim fix
     // the gradient chain, and mean pooling in encode_concept fixes the EOS
     // dominance bug (all inputs ended with same token at same position).
+    let accum_steps = config.grad_accum_steps.max(1);
     let sft_config = TrainingConfig {
         lr: config.sft_lr,
         min_lr: config.sft_lr * 0.01,
         weight_decay: 0.01,
         warmup_fraction: 0.1,
         total_steps: config.sft_steps,
-        grad_accum_steps: 1,
+        grad_accum_steps: accum_steps,
         max_grad_norm: 1.0,
         label_smoothing: 0.0,
     };
 
     let mut trainer = Trainer::new(varmap.clone(), sft_config)?;
 
-    eprintln!("[brain] v16 SFT: {} train dialogues, batch={}, {} steps, lr={:.2e}, noise={:.1}%, encoder=DIRECT",
-        n_dialogues, batch_size, config.sft_steps, config.sft_lr,
-        config.max_noise_rate * 100.0);
+    if accum_steps > 1 {
+        eprintln!("[brain] v16 SFT: {} train dialogues, micro_batch={}, accum={}, effective_batch={}, {} steps, lr={:.2e}, noise={:.1}%, encoder=DIRECT",
+            n_dialogues, batch_size, accum_steps, batch_size * accum_steps,
+            config.sft_steps, config.sft_lr, config.max_noise_rate * 100.0);
+    } else {
+        eprintln!("[brain] v16 SFT: {} train dialogues, batch={}, {} steps, lr={:.2e}, noise={:.1}%, encoder=DIRECT",
+            n_dialogues, batch_size, config.sft_steps, config.sft_lr,
+            config.max_noise_rate * 100.0);
+    }
 
     // Pre-flatten data for full-batch mode (test configs)
     let (full_goal_batch, full_raw_input, full_target_batch, full_weight_batch) = if !use_minibatch {
@@ -976,99 +989,100 @@ pub fn train_brain_talk(
             config.max_noise_rate
         };
 
-        let (goal_t, input_t, target_t, weight_t) = if use_minibatch {
-            let mut bg = Vec::with_capacity(batch_size * enc_seq);
-            let mut bi = Vec::with_capacity(batch_size * dec_seq);
-            let mut bt = Vec::with_capacity(batch_size * dec_seq);
-            let mut bw = Vec::with_capacity(batch_size * dec_seq);
+        // v23: Gradient accumulation — run accum_steps micro-batches per optimizer step.
+        // When accum_steps=1, this is equivalent to the original single-batch path.
+        let mut step_loss_sum = 0.0f32;
+        let micro_iters = if use_minibatch { accum_steps } else { 1 };
 
-            for _ in 0..batch_size {
-                let idx = rng.next_usize(n_dialogues);
-                let (ref goal, ref inp, ref tgt, ref wt) = data[idx];
-                bg.extend_from_slice(goal);
-                for &tok_id in inp.iter() {
+        for _micro in 0..micro_iters {
+            let (goal_t, input_t, target_t, weight_t) = if use_minibatch {
+                let mut bg = Vec::with_capacity(batch_size * enc_seq);
+                let mut bi = Vec::with_capacity(batch_size * dec_seq);
+                let mut bt = Vec::with_capacity(batch_size * dec_seq);
+                let mut bw = Vec::with_capacity(batch_size * dec_seq);
+
+                for _ in 0..batch_size {
+                    let idx = rng.next_usize(n_dialogues);
+                    let (ref goal, ref inp, ref tgt, ref wt) = data[idx];
+                    bg.extend_from_slice(goal);
+                    for &tok_id in inp.iter() {
+                        if tok_id != TOK_PAD && tok_id != TOK_BOS && rng.next_f64() < noise_rate {
+                            bi.push(TOK_PAD);
+                        } else {
+                            bi.push(tok_id);
+                        }
+                    }
+                    bt.extend_from_slice(tgt);
+                    bw.extend_from_slice(wt);
+                }
+
+                (
+                    Tensor::from_vec(bg, (batch_size, enc_seq), device)?,
+                    Tensor::from_vec(bi, (batch_size, dec_seq), device)?,
+                    Tensor::from_vec(bt, (batch_size, dec_seq), device)?,
+                    Tensor::from_vec(bw, (batch_size, dec_seq), device)?,
+                )
+            } else {
+                let raw = full_raw_input.as_ref().unwrap();
+                let noisy: Vec<u32> = raw.iter().map(|&tok_id| {
                     if tok_id != TOK_PAD && tok_id != TOK_BOS && rng.next_f64() < noise_rate {
-                        bi.push(TOK_PAD);
+                        TOK_PAD
                     } else {
-                        bi.push(tok_id);
+                        tok_id
+                    }
+                }).collect();
+                (
+                    full_goal_batch.as_ref().unwrap().clone(),
+                    Tensor::from_vec(noisy, (n_dialogues, dec_seq), device)?,
+                    full_target_batch.as_ref().unwrap().clone(),
+                    full_weight_batch.as_ref().unwrap().clone(),
+                )
+            };
+
+            // v14: Direct encoder forward — gradients flow through encoder via
+            // GradRmsNorm + grad_softmax_last_dim (fixed candle-nn backward bugs).
+            // encode_concept now uses mean pooling over non-PAD tokens.
+            let concept_vec = brain.encode_concept(&goal_t)?;
+
+            // T-020: Memory augmentation — after warmup, randomly sample K memories
+            // from the pool and build a memory prefix tensor.
+            let use_mem = step >= memory_warmup
+                && memory_pool.len() >= memory_k
+                && rng.next_f64() < memory_prob;
+
+            let mem_tensor = if use_mem {
+                let mut mem_data = Vec::with_capacity(memory_k * d_model);
+                let bs = goal_t.dim(0)?;
+                for _ in 0..memory_k {
+                    let idx = rng.next_usize(memory_pool.len());
+                    mem_data.extend_from_slice(&memory_pool[idx]);
+                }
+                Some(Tensor::from_vec(mem_data, (1, memory_k, d_model), device)?.broadcast_as((bs, memory_k, d_model))?.contiguous()?)
+            } else {
+                None
+            };
+
+            let logits = brain.forward_from_concept_t(&concept_vec, &input_t, mem_tensor.as_ref(), true)?;
+            let loss = weighted_cross_entropy(&logits, &target_t, 0.0, Some(&weight_t))?;
+
+            // T-020: Store batch concept vectors in memory pool (detached from graph).
+            {
+                let cv_data: Vec<Vec<f32>> = concept_vec.to_vec2()?;
+                for cv in cv_data {
+                    if memory_pool.len() < config.memory_capacity * 10 {
+                        memory_pool.push(cv);
+                    } else {
+                        let idx = rng.next_usize(memory_pool.len());
+                        memory_pool[idx] = cv;
                     }
                 }
-                bt.extend_from_slice(tgt);
-                bw.extend_from_slice(wt);
             }
 
-            (
-                Tensor::from_vec(bg, (batch_size, enc_seq), device)?,
-                Tensor::from_vec(bi, (batch_size, dec_seq), device)?,
-                Tensor::from_vec(bt, (batch_size, dec_seq), device)?,
-                Tensor::from_vec(bw, (batch_size, dec_seq), device)?,
-            )
-        } else {
-            let raw = full_raw_input.as_ref().unwrap();
-            let noisy: Vec<u32> = raw.iter().map(|&tok_id| {
-                if tok_id != TOK_PAD && tok_id != TOK_BOS && rng.next_f64() < noise_rate {
-                    TOK_PAD
-                } else {
-                    tok_id
-                }
-            }).collect();
-            (
-                full_goal_batch.as_ref().unwrap().clone(),
-                Tensor::from_vec(noisy, (n_dialogues, dec_seq), device)?,
-                full_target_batch.as_ref().unwrap().clone(),
-                full_weight_batch.as_ref().unwrap().clone(),
-            )
-        };
-
-        // v14: Direct encoder forward — gradients flow through encoder via
-        // GradRmsNorm + grad_softmax_last_dim (fixed candle-nn backward bugs).
-        // encode_concept now uses mean pooling over non-PAD tokens.
-        // T-020: encode concepts separately so we can (a) cache for memory pool and
-        // (b) optionally inject memory prefix for memory-augmented training.
-        let concept_vec = brain.encode_concept(&goal_t)?;
-
-        // T-020: Memory augmentation — after warmup, randomly sample K memories
-        // from the pool and build a memory prefix tensor.
-        let use_mem = step >= memory_warmup
-            && memory_pool.len() >= memory_k
-            && rng.next_f64() < memory_prob;
-
-        let mem_tensor = if use_mem {
-            let mut mem_data = Vec::with_capacity(memory_k * d_model);
-            let bs = goal_t.dim(0)?;
-            // Sample K distinct indices from pool (with replacement if pool < K * bs)
-            for _ in 0..memory_k {
-                let idx = rng.next_usize(memory_pool.len());
-                mem_data.extend_from_slice(&memory_pool[idx]);
-            }
-            // Broadcast same memory across batch: (1, K, d_model) -> broadcasts with (batch, ...) in build_prefix
-            Some(Tensor::from_vec(mem_data, (1, memory_k, d_model), device)?.broadcast_as((bs, memory_k, d_model))?.contiguous()?)
-        } else {
-            None
-        };
-
-        let logits = brain.forward_from_concept_t(&concept_vec, &input_t, mem_tensor.as_ref(), true)?;
-        let loss = weighted_cross_entropy(&logits, &target_t, 0.0, Some(&weight_t))?;
-
-        // T-020: Store batch concept vectors in memory pool (detached from graph).
-        // Cap pool at 10x memory_capacity to avoid unbounded growth.
-        {
-            let cv_data: Vec<Vec<f32>> = concept_vec.to_vec2()?;
-            for cv in cv_data {
-                if memory_pool.len() < config.memory_capacity * 10 {
-                    memory_pool.push(cv);
-                } else {
-                    // Replace random entry (reservoir sampling)
-                    let idx = rng.next_usize(memory_pool.len());
-                    memory_pool[idx] = cv;
-                }
-            }
+            step_loss_sum += loss.to_scalar::<f32>()?;
+            trainer.accumulate_and_step(&loss)?;
         }
 
-        let loss_val = loss.to_scalar::<f32>()?;
-        losses.push(loss_val);
-
-        trainer.backward_step(&loss)?;
+        losses.push(step_loss_sum / micro_iters as f32);
 
         let log_interval = std::env::var("GESTALT_LOG_EVERY")
             .ok().and_then(|v| v.parse::<usize>().ok())

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
+use candle_core::backprop::GradStore;
 use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarMap};
 use std::process::Command;
 use std::time::Instant;
@@ -92,6 +93,7 @@ pub struct Trainer {
     pub scheduler: CosineScheduler,
     pub config: TrainingConfig,
     pub varmap: VarMap,
+    accum_grads: Option<GradStore>,
     accum_count: usize,
     step_count: usize,
     timer_start: Instant,
@@ -117,21 +119,54 @@ impl Trainer {
             scheduler,
             config,
             varmap,
+            accum_grads: None,
             accum_count: 0,
             step_count: 0,
             timer_start: Instant::now(),
         })
     }
 
-    /// Accumulate a loss. Returns Some(step_number) when optimizer actually steps.
+    /// Accumulate gradients from a micro-batch loss. Properly accumulates gradient
+    /// tensors across micro-batches and only steps the optimizer when all micro-batches
+    /// are processed. Returns Some(step_number) when an optimizer step occurs.
+    ///
+    /// The loss is scaled by 1/N internally so accumulated gradients are averaged.
     pub fn accumulate_and_step(&mut self, loss: &Tensor) -> Result<Option<usize>> {
-        let scale = 1.0 / self.config.grad_accum_steps as f64;
-        let scaled_loss = (loss * scale)?;
+        // Scale loss by 1/N so gradients are averaged across micro-batches
+        let scaled = if self.config.grad_accum_steps > 1 {
+            (loss / self.config.grad_accum_steps as f64)?
+        } else {
+            loss.clone()
+        };
+        let grads = scaled.backward()?;
 
-        self.optimizer.backward_step(&scaled_loss)?;
+        // Accumulate gradients into stored GradStore
+        match &mut self.accum_grads {
+            None => {
+                self.accum_grads = Some(grads);
+            }
+            Some(accum) => {
+                for var in self.varmap.all_vars() {
+                    let t = var.as_tensor();
+                    if let Some(new_g) = grads.get(t) {
+                        let sum = if let Some(existing) = accum.get(t) {
+                            (existing + new_g)?
+                        } else {
+                            new_g.clone()
+                        };
+                        accum.insert(t, sum);
+                    }
+                }
+            }
+        }
+
         self.accum_count += 1;
 
         if self.accum_count >= self.config.grad_accum_steps {
+            // Step optimizer with accumulated (averaged) gradients
+            if let Some(grads) = self.accum_grads.take() {
+                self.optimizer.step(&grads)?;
+            }
             self.accum_count = 0;
             self.step_count += 1;
             let new_lr = self.scheduler.step();
