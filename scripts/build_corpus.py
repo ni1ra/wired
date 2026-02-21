@@ -8,8 +8,13 @@ Sources:
 2. OASST2 (OpenAssistant/oasst2) - Apache 2.0
 3. Existing hand-written pairs (brain_corpus.json)
 4. Template-based generation for JARVIS-specific categories
+5. Alpaca (tatsu-lab/alpaca) - Apache 2.0
+6. UltraChat 200K (HuggingFaceH4/ultrachat_200k) - MIT
+7. SlimOrca-Dedup (Open-Orca/SlimOrca-Dedup) - GPT-4 completions
+8. No Robots (HuggingFaceH4/no_robots) - CC-BY-NC 4.0
+9. WizardLM Evol-Instruct 70K (WizardLMTeam/WizardLM_evol_instruct_70k)
 
-Target: 20,000-50,000 unique pairs
+Target: 100,000+ unique pairs
 """
 
 import json
@@ -23,10 +28,10 @@ from collections import Counter
 # === CONFIG ===
 PROJECT_ROOT = Path(__file__).parent.parent
 CORPUS_PATH = PROJECT_ROOT / "data" / "brain_corpus.json"
-OUTPUT_PATH = PROJECT_ROOT / "data" / "brain_corpus_v19.json"
+OUTPUT_PATH = PROJECT_ROOT / "data" / "brain_corpus_v23.json"
 MAX_RESPONSE_CHARS = 500  # Match current corpus max
 MIN_RESPONSE_CHARS = 20
-MAX_PROMPT_CHARS = 200
+MAX_PROMPT_CHARS = 300  # v23: relaxed from 200 to capture more interesting prompts
 SEED = 42
 
 random.seed(SEED)
@@ -109,7 +114,11 @@ def lists_to_prose(text: str) -> str:
                     item = item[0].lower() + item[1:]
                 clean_items.append(item)
 
-        if len(clean_items) <= 5:
+        if len(clean_items) == 0:
+            return text
+        elif len(clean_items) == 1:
+            prose = clean_items[0] + "."
+        elif len(clean_items) <= 5:
             prose = ", ".join(clean_items[:-1]) + ", and " + clean_items[-1] + "."
         else:
             # Too many items — take first 5
@@ -722,6 +731,295 @@ def load_alpaca(max_pairs: int = 10000) -> list:
     return pairs
 
 
+# === SOURCE 6: ULTRACHAT 200K ===
+
+def load_ultrachat(max_pairs: int = 40000) -> list:
+    """Download and process UltraChat 200K (first-turn extraction, MIT license)."""
+    print("[ultrachat] Loading HuggingFaceH4/ultrachat_200k...")
+    try:
+        from datasets import load_dataset
+        ds = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft")
+    except Exception as e:
+        print(f"[ultrachat] Failed to load: {e}")
+        return []
+
+    pairs = []
+    skipped = Counter()
+
+    for item in ds:
+        messages = item.get("messages", [])
+        if len(messages) < 2:
+            skipped["too_few_turns"] += 1
+            continue
+
+        user_msg = None
+        asst_msg = None
+        for msg in messages:
+            if msg["role"] == "user" and user_msg is None:
+                user_msg = msg["content"].strip()
+            elif msg["role"] == "assistant" and asst_msg is None:
+                asst_msg = msg["content"].strip()
+            if user_msg and asst_msg:
+                break
+
+        if not user_msg or not asst_msg:
+            skipped["missing_roles"] += 1
+            continue
+
+        if len(user_msg) < 5 or len(user_msg) > MAX_PROMPT_CHARS:
+            skipped["prompt_length"] += 1
+            continue
+
+        if len(asst_msg) < MIN_RESPONSE_CHARS or len(asst_msg) > 2000:
+            skipped["response_length"] += 1
+            continue
+
+        if asst_msg.count("\n") > 10:
+            skipped["list_format"] += 1
+            continue
+
+        if not all(ord(c) < 256 for c in user_msg[:50]):
+            skipped["non_english"] += 1
+            continue
+
+        if is_task_instruction(user_msg):
+            skipped["task_instruction"] += 1
+            continue
+
+        voiced = revoice_response(asst_msg)
+        if len(voiced) < MIN_RESPONSE_CHARS:
+            skipped["too_short_after_trim"] += 1
+            continue
+
+        if has_identity_leak(voiced):
+            skipped["identity_leak"] += 1
+            continue
+
+        pairs.append({
+            "user": user_msg,
+            "assistant": voiced,
+            "_source": "ultrachat",
+        })
+
+    random.shuffle(pairs)
+    pairs = pairs[:max_pairs]
+
+    print(f"[ultrachat] Loaded {len(pairs)} pairs (skipped: {dict(skipped)})")
+    return pairs
+
+
+# === SOURCE 7: SLIMORCA-DEDUP ===
+
+def load_slimorca(max_pairs: int = 30000) -> list:
+    """Download and process SlimOrca-Dedup (GPT-4 completions)."""
+    print("[slimorca] Loading Open-Orca/SlimOrca-Dedup...")
+    try:
+        from datasets import load_dataset
+        ds = load_dataset("Open-Orca/SlimOrca-Dedup", split="train")
+    except Exception as e:
+        print(f"[slimorca] Failed to load: {e}")
+        return []
+
+    pairs = []
+    skipped = Counter()
+
+    for item in ds:
+        conversations = item.get("conversations", [])
+
+        user_msg = None
+        asst_msg = None
+        for turn in conversations:
+            role = turn.get("from", "")
+            value = turn.get("value", "").strip()
+            if role == "human" and user_msg is None:
+                user_msg = value
+            elif role == "gpt" and asst_msg is None:
+                asst_msg = value
+
+        if not user_msg or not asst_msg:
+            skipped["missing_roles"] += 1
+            continue
+
+        if len(user_msg) < 5 or len(user_msg) > MAX_PROMPT_CHARS:
+            skipped["prompt_length"] += 1
+            continue
+
+        if len(asst_msg) < MIN_RESPONSE_CHARS or len(asst_msg) > 2000:
+            skipped["response_length"] += 1
+            continue
+
+        if asst_msg.count("\n") > 10:
+            skipped["list_format"] += 1
+            continue
+
+        if not all(ord(c) < 256 for c in user_msg[:50]):
+            skipped["non_english"] += 1
+            continue
+
+        if is_task_instruction(user_msg):
+            skipped["task_instruction"] += 1
+            continue
+
+        voiced = revoice_response(asst_msg)
+        if len(voiced) < MIN_RESPONSE_CHARS:
+            skipped["too_short_after_trim"] += 1
+            continue
+
+        if has_identity_leak(voiced):
+            skipped["identity_leak"] += 1
+            continue
+
+        pairs.append({
+            "user": user_msg,
+            "assistant": voiced,
+            "_source": "slimorca",
+        })
+
+    random.shuffle(pairs)
+    pairs = pairs[:max_pairs]
+
+    print(f"[slimorca] Loaded {len(pairs)} pairs (skipped: {dict(skipped)})")
+    return pairs
+
+
+# === SOURCE 8: NO ROBOTS ===
+
+def load_no_robots(max_pairs: int = 7000) -> list:
+    """Download and process No Robots (human-written, CC-BY-NC 4.0)."""
+    print("[no_robots] Loading HuggingFaceH4/no_robots...")
+    try:
+        from datasets import load_dataset
+        ds = load_dataset("HuggingFaceH4/no_robots", split="train")
+    except Exception as e:
+        print(f"[no_robots] Failed to load: {e}")
+        return []
+
+    pairs = []
+    skipped = Counter()
+
+    for item in ds:
+        messages = item.get("messages", [])
+        if len(messages) < 2:
+            skipped["too_few_turns"] += 1
+            continue
+
+        user_msg = None
+        asst_msg = None
+        for msg in messages:
+            if msg["role"] == "user" and user_msg is None:
+                user_msg = msg["content"].strip()
+            elif msg["role"] == "assistant" and asst_msg is None:
+                asst_msg = msg["content"].strip()
+            if user_msg and asst_msg:
+                break
+
+        if not user_msg or not asst_msg:
+            skipped["missing_roles"] += 1
+            continue
+
+        if len(user_msg) < 5 or len(user_msg) > MAX_PROMPT_CHARS:
+            skipped["prompt_length"] += 1
+            continue
+
+        if len(asst_msg) < MIN_RESPONSE_CHARS or len(asst_msg) > 2000:
+            skipped["response_length"] += 1
+            continue
+
+        if asst_msg.count("\n") > 10:
+            skipped["list_format"] += 1
+            continue
+
+        if not all(ord(c) < 256 for c in user_msg[:50]):
+            skipped["non_english"] += 1
+            continue
+
+        if is_task_instruction(user_msg):
+            skipped["task_instruction"] += 1
+            continue
+
+        voiced = revoice_response(asst_msg)
+        if len(voiced) < MIN_RESPONSE_CHARS:
+            skipped["too_short_after_trim"] += 1
+            continue
+
+        if has_identity_leak(voiced):
+            skipped["identity_leak"] += 1
+            continue
+
+        pairs.append({
+            "user": user_msg,
+            "assistant": voiced,
+            "_source": "no_robots",
+        })
+
+    random.shuffle(pairs)
+    pairs = pairs[:max_pairs]
+
+    print(f"[no_robots] Loaded {len(pairs)} pairs (skipped: {dict(skipped)})")
+    return pairs
+
+
+# === SOURCE 9: WIZARDLM EVOL-INSTRUCT ===
+
+def load_wizardlm(max_pairs: int = 15000) -> list:
+    """Download and process WizardLM Evol-Instruct 70K."""
+    print("[wizardlm] Loading WizardLMTeam/WizardLM_evol_instruct_70k...")
+    try:
+        from datasets import load_dataset
+        ds = load_dataset("WizardLMTeam/WizardLM_evol_instruct_70k", split="train")
+    except Exception as e:
+        print(f"[wizardlm] Failed to load: {e}")
+        return []
+
+    pairs = []
+    skipped = Counter()
+
+    for item in ds:
+        instruction = item.get("instruction", "").strip()
+        output = item.get("output", "").strip()
+
+        if len(instruction) < 5 or len(instruction) > MAX_PROMPT_CHARS:
+            skipped["prompt_length"] += 1
+            continue
+
+        if len(output) < MIN_RESPONSE_CHARS or len(output) > 2000:
+            skipped["response_length"] += 1
+            continue
+
+        if output.count("\n") > 10:
+            skipped["list_format"] += 1
+            continue
+
+        if not all(ord(c) < 256 for c in instruction[:50]):
+            skipped["non_english"] += 1
+            continue
+
+        if is_task_instruction(instruction):
+            skipped["task_instruction"] += 1
+            continue
+
+        voiced = revoice_response(output)
+        if len(voiced) < MIN_RESPONSE_CHARS:
+            skipped["too_short_after_trim"] += 1
+            continue
+
+        if has_identity_leak(voiced):
+            skipped["identity_leak"] += 1
+            continue
+
+        pairs.append({
+            "user": instruction,
+            "assistant": voiced,
+            "_source": "wizardlm",
+        })
+
+    random.shuffle(pairs)
+    pairs = pairs[:max_pairs]
+
+    print(f"[wizardlm] Loaded {len(pairs)} pairs (skipped: {dict(skipped)})")
+    return pairs
+
+
 # === SOURCE 4: EXISTING CORPUS ===
 
 def load_existing() -> list:
@@ -1191,6 +1489,22 @@ def main():
     # Source 5: Alpaca
     alpaca = load_alpaca(max_pairs=10000)
     all_pairs.extend(alpaca)
+
+    # Source 6: UltraChat 200K
+    ultrachat = load_ultrachat(max_pairs=40000)
+    all_pairs.extend(ultrachat)
+
+    # Source 7: SlimOrca-Dedup
+    slimorca = load_slimorca(max_pairs=30000)
+    all_pairs.extend(slimorca)
+
+    # Source 8: No Robots
+    no_robots = load_no_robots(max_pairs=7000)
+    all_pairs.extend(no_robots)
+
+    # Source 9: WizardLM Evol-Instruct
+    wizardlm = load_wizardlm(max_pairs=15000)
+    all_pairs.extend(wizardlm)
 
     # Deduplicate
     unique = deduplicate(all_pairs)
