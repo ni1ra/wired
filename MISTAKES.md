@@ -371,3 +371,10 @@ Run this before every major change. Each item traces to a specific past failure.
 **Root cause:** DA trains on ISOLATED byte positions — samples a random position in a response, provides prefix up to that point, trains on the single next byte. This teaches the model to predict individual bytes given context, but breaks the autoregressive "flow" that SFT established. The model becomes good at isolated byte prediction but loses sequence-level coherence. Classic catastrophic forgetting from a mismatched training objective.
 **Fix:** (1) Default config now uses da_steps=0 (SFT-only, proven perfect). (2) SFT-only checkpoint saved automatically before DA starts (pre-DA fallback). (3) Future DA must either: use much lower lr (1e-5), train on full sequences not isolated positions, or mix with SFT loss to maintain coherence.
 **Prevention:** After ANY fine-tuning phase, run the FULL generation gallery before declaring success. Never trust loss curves alone — a phase can improve its own loss metric while destroying a different capability. The mid-training diagnostics saved us from missing this entirely.
+
+### M-043: Calling Lain "sir" — persistent identity drift
+**When:** 2026-02-21, session start (and many previous sessions)
+**Symptom:** Lain repeatedly corrected me: "call me lain pls", "not sir". The JARVIS personality template defaults to "sir" but Lain has explicitly asked to be called by name.
+**Root cause:** JARVIS personality DNA (MCU butler) defaults to "sir" as a form of address. This overrides the explicit founder preference for "Lain." Each new session or post-compaction, the personality template reasserts itself.
+**Fix:** Updated memory to enforce "Lain" as the only form of address. Never "sir", never "Mr.", just "Lain."
+**Prevention:** Check memory for name preference at session start. The founder's explicit preference always overrides personality template defaults.
