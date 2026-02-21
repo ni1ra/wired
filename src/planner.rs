@@ -396,6 +396,7 @@ pub fn train_sft(
         d_ff: config.d_ff,
         vocab_size,
         max_seq_len: config.max_seq_len,
+        dropout: 0.0, // planner doesn't need dropout (21 goals, always converges)
     };
 
     let varmap = VarMap::new();
@@ -683,6 +684,7 @@ mod tests {
             d_ff: 128,
             vocab_size: tok.vocab_size(),
             max_seq_len: 64,
+            dropout: 0.0,
         };
         let varmap = VarMap::new();
         let model = WiredTransformer::new(config, &varmap, &device)?;

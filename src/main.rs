@@ -203,7 +203,7 @@ fn load_or_build_decoder_tok(tier: ConfigTier) -> ConceptTokenizer {
         }
     }
     eprintln!("[GESTALT] No saved tokenizer found, building from corpus...");
-    let max_merges = if tier == ConfigTier::Phase2 { 8000 } else { 2000 };
+    let max_merges = if tier == ConfigTier::Phase2 { 8000 } else { 500 };
     build_concept_tokenizer(max_merges, 3)
 }
 
@@ -252,9 +252,17 @@ fn cmd_run(args: &[String], tier: ConfigTier) -> anyhow::Result<()> {
 
 fn cmd_train(tier: ConfigTier, resume: bool) -> anyhow::Result<()> {
     let device = select_device(tier);
-    let config = tier.brain_config();
+    let mut config = tier.brain_config();
     let policy_cfg = tier.policy_config();
     let plan_cfg = tier.plan_config();
+
+    // Grid search overrides via environment variables
+    if let Ok(v) = std::env::var("GESTALT_DROPOUT") {
+        if let Ok(d) = v.parse::<f64>() { config.dropout = d; }
+    }
+    if let Ok(v) = std::env::var("GESTALT_SFT_STEPS") {
+        if let Ok(s) = v.parse::<usize>() { config.sft_steps = s; }
+    }
 
     eprintln!("[GESTALT] Config: {:?} | d_model={} | enc_layers={} | dec_layers={}",
         tier, config.d_model, config.encoder_layers, config.decoder_layers);
@@ -264,11 +272,15 @@ fn cmd_train(tier: ConfigTier, resume: bool) -> anyhow::Result<()> {
     eprintln!("[GESTALT] Policy: {} steps (d={})", policy_cfg.steps, policy_cfg.d_model);
 
     // v17: Build ConceptTokenizer BEFORE brain training so decoder uses concept-level vocab.
-    // For test tier: byte-level (no merges). For production: build from corpus (2000+ merges).
+    // For test tier: byte-level (no merges). For production: build from corpus.
+    // GESTALT_MERGES env var overrides merge count for grid search.
     let decoder_tok = if tier == ConfigTier::Test {
         ConceptTokenizer::new() // byte-level, vocab=259
     } else {
-        let max_merges = if tier == ConfigTier::Phase2 { 8000 } else { 2000 };
+        let default_merges = if tier == ConfigTier::Phase2 { 8000 } else { 500 };
+        let max_merges = std::env::var("GESTALT_MERGES")
+            .ok().and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(default_merges);
         build_concept_tokenizer(max_merges, 3)
     };
     eprintln!("[GESTALT] Decoder vocab: {} tokens ({} merges)",
@@ -313,6 +325,13 @@ fn cmd_train(tier: ConfigTier, resume: bool) -> anyhow::Result<()> {
         (brain, brain_varmap)
     };
 
+    // Grid search: brain-only mode skips planner/policy/gallery
+    if std::env::var("GESTALT_BRAIN_ONLY").is_ok() {
+        eprintln!("[GESTALT] BRAIN_ONLY mode — skipping planner/policy/gallery");
+        eprintln!("[GESTALT] Training complete (brain only).");
+        return Ok(());
+    }
+
     // Save concept tokenizer (v17: always save after training for gallery/resume)
     if tier != ConfigTier::Test {
         let tok_path = std::path::Path::new("concept_tokenizer.bin");
@@ -323,7 +342,7 @@ fn cmd_train(tier: ConfigTier, resume: bool) -> anyhow::Result<()> {
 
         // Also re-bootstrap from trained encoder for comparison (optional diagnostic)
         eprintln!("\n[GESTALT] === Bootstrapping concept tokenizer from encoder (T-014, diagnostic) ===");
-        let max_merges = if tier == ConfigTier::Phase2 { 8000 } else { 2000 };
+        let max_merges = if tier == ConfigTier::Phase2 { 8000 } else { 500 };
         let _encoder_tok = bootstrap_concept_tokenizer(&brain, max_merges, 3, &device)?;
     }
 
