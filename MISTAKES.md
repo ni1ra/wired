@@ -28,6 +28,8 @@ Run this before every major change. Each item traces to a specific past failure.
 - [ ] **Meta recursion:** Meta tools (eval/train) must NEVER execute inside training loops or ReAct. (M-017)
 - [ ] **Gradient chain:** Before first training run, verify EVERY Var in VarMap gets nonzero gradient from dummy loss. Test each layer type (norm, attention, MLP, embedding). (M-032)
 - [ ] **Vision questions:** NEVER answer architecture/vision questions from memory. Re-read BLUEPRINT.md + ALL_TASKS.md first. (M-024)
+- [ ] **Tokenizer save:** After ANY training mode (including BRAIN_ONLY), verify the tokenizer is saved to disk before exit. (M-052)
+- [ ] **Tokenizer determinism:** Build tokenizer twice from same corpus, assert identical merge tables. Non-deterministic tokenizers silently corrupt generation. (M-052)
 - [ ] **Listener cleanup:** Before launching Discord listeners, kill existing ones. Check `ps aux | grep navi-listener`. (M-025)
 - [ ] **Vocab match:** When encoding input for a model, verify which embedding table it uses. Policy=BYTE_VOCAB(256), Language=TALK_VOCAB(259). (M-026)
 - [ ] **Heartbeat first:** After ANY compaction or session start, set up navi-heartbeat timer (5m recurring) and check discord_get_history BEFORE any other work. (M-027, M-028)
@@ -372,9 +374,88 @@ Run this before every major change. Each item traces to a specific past failure.
 **Fix:** (1) Default config now uses da_steps=0 (SFT-only, proven perfect). (2) SFT-only checkpoint saved automatically before DA starts (pre-DA fallback). (3) Future DA must either: use much lower lr (1e-5), train on full sequences not isolated positions, or mix with SFT loss to maintain coherence.
 **Prevention:** After ANY fine-tuning phase, run the FULL generation gallery before declaring success. Never trust loss curves alone — a phase can improve its own loss metric while destroying a different capability. The mid-training diagnostics saved us from missing this entirely.
 
+### M-044: Token-level repetition penalty destroys coherent byte-level output
+**When:** 2026-02-21, deep-debug session
+**Symptom:** Gallery outputs for simple prompts were incoherent despite val_loss=1.58. "hello" → "Hello! I'm here to hear. What's genuine - you can choose from?" instead of the model's actual learned response.
+**Root cause:** `apply_repetition_penalty` with penalty=1.3 applied to ALL tokens including raw bytes (ID 0-255). With a 459-token byte-level vocab, individual characters like 'H', 'e', 'o' naturally repeat in any text. Penalizing them forced the model off its learned distribution. The diagnostic per-token trace revealed the raw greedy output was "Hello! How can I assist you today?" (p>0.5 at every position) — the rep_penalty was destroying a perfect response.
+**How diagnosed:** Built a 4-test diagnostic (`gestalt diagnose`): per-token probability trace, concept prefix discrimination, teacher-forced accuracy, and entropy trace. ONE diagnostic run revealed raw greedy was coherent, proving the penalty was the culprit.
+**Fix:** Replaced token-level penalty with N-gram repetition penalty (4-gram, penalty=2.0). Only penalizes when a full 4-token sequence would repeat. Individual byte reuse is unrestricted. Prevents loops ("light-light-light") without harming coherence.
+**Time to diagnose:** ~40 minutes (1 diagnostic run + 3 gallery comparisons)
+**Blind experiments before diagnostic:** 0 — instrumented first, diagnosed first try
+**Lesson:** Repetition penalty designed for 50K-token word-level vocabularies (GPT-2) is catastrophic for byte-level tokenizers. Always consider the tokenization granularity when applying sampling heuristics. N-gram penalty is the correct approach for byte-level/subword vocabs with < 1K tokens.
+
+### M-045: brain_checkpoint.safetensors saved FINAL weights instead of BEST weights
+**When:** 2026-02-21, discovered during code audit
+**Symptom:** After training with early stopping, `brain_checkpoint.safetensors` (used by gallery/serve/run commands) contained the model weights from the LAST training step, not the BEST validation loss step. If training overshot past the best val_loss, the gallery evaluated a worse model than what was available.
+**Root cause:** `train_brain_talk()` returned the brain with current (last-step) weights in the VarMap. `cmd_train` then called `save_checkpoint(&brain_varmap, "brain_checkpoint.safetensors")` which saved those last-step weights. Meanwhile, the BEST weights were in `brain_best_sft.safetensors` (saved by EarlyStopping during training). The two checkpoints diverged whenever the model overfit past its best point.
+**Fix:** Added `load_checkpoint(&varmap, "brain_best_sft.safetensors", device)` after the training loop exits, before post-SFT diagnostics and DA. Now the function always returns with best-val-loss weights loaded.
+**Time to diagnose:** ~10 minutes (found during systematic code audit while GPU training)
+**Blind experiments before diagnostic:** 0
+**Lesson:** When a training loop saves "best" checkpoints incrementally, verify the returned model actually has those best weights loaded. The "save best during training" and "return model after training" can diverge silently.
+
 ### M-043: Calling Lain "sir" — persistent identity drift
 **When:** 2026-02-21, session start (and many previous sessions)
 **Symptom:** Lain repeatedly corrected me: "call me lain pls", "not sir". The JARVIS personality template defaults to "sir" but Lain has explicitly asked to be called by name.
 **Root cause:** JARVIS personality DNA (MCU butler) defaults to "sir" as a form of address. This overrides the explicit founder preference for "Lain." Each new session or post-compaction, the personality template reasserts itself.
 **Fix:** Updated memory to enforce "Lain" as the only form of address. Never "sir", never "Mr.", just "Lain."
 **Prevention:** Check memory for name preference at session start. The founder's explicit preference always overrides personality template defaults.
+
+### M-046: Top-P temperature ordering bug — nucleus sampling used wrong distribution
+**When:** 2026-02-21, discovered during external audit
+**Symptom:** With temperature=0.5, top-p admitted too many candidate tokens. Generation was less focused than the temperature setting intended.
+**Root cause:** `apply_top_p` computed softmax probabilities at T=1.0 (implicit — just `exp(l - max)`), then used that flat distribution to determine the nucleus cutoff. After filtering, `sample_with_temperature` applied the actual temperature to the surviving logits. The nucleus width was determined by a T=1.0 distribution, not the user's intended T=0.5 distribution.
+**Fix:** Scale logits by `1.0 / temperature` BEFORE passing to `apply_top_k` and `apply_top_p`. Then sample the surviving logits at T=1.0 (already scaled). Now the nucleus cutoff uses the correct probability shape.
+**Prevention:** When chaining sampling operations (temperature, top-k, top-p), temperature must be applied FIRST because it changes the probability distribution shape that subsequent filters operate on. Order matters: temperature → top-k → top-p → sample.
+
+### M-047: Empty task list after compaction — no operational backbone
+**When:** 2026-02-21, post-compaction
+**Symptom:** After context compaction, TaskList returned zero tasks. No tracking of current work, pending items, or deferred audit findings. Operating without any structured task tracking — just vibing on compact summary.
+**Root cause:** Tasks are in-memory only. Context compaction wipes them. The compact summary mentions what was being worked on, but doesn't recreate the task list. Without tasks, there's no structured backbone to keep work aligned — especially critical for multi-step work that spans compaction boundaries.
+**Fix:** Rebuild task list immediately after compaction as part of recon protocol. Create tasks from: (1) compact summary's "pending tasks" section, (2) current plan file, (3) deferred items from MISTAKES.md or audit findings.
+**Prevention:** Add "Rebuild task list" as step 8 of the Post-Compact Recon Protocol in CLAUDE.md. Tasks are the operational backbone — without them, work drifts and items get dropped silently.
+
+### M-048: Trained obsolete architecture instead of building the final one
+**When:** 2026-02-21, post external audit
+**Symptom:** Received a comprehensive external audit identifying exactly what the final architecture should look like (KV cache, NTK-aware RoPE, cross-attention memory, sequence packing). Responded by launching another training run on the OLD architecture — same seq=256, no KV cache, quadratic generation, fixed RoPE. Burned GPU hours on a version we knew was about to be replaced.
+**Root cause:** Incrementalism bias. Defaulting to "iterate on what exists" instead of "build what we actually want." The manifesto explicitly says: build the final version as soon as you know what it looks like. The audit gave us a clear picture of the final architecture. The correct response was to implement the architectural changes FIRST, then train. Instead I patched two small bugs (patience, top-p ordering) and trained the same fundamentally limited system.
+**Fix:** Killed the training. Building KV cache, NTK RoPE, and cross-attention into the existing codebase before any more training runs.
+**Prevention:** When an audit or design review reveals what the final architecture should be, STOP iterating on the current one. Implement the architectural changes first, then train. Training an architecture you know is wrong is wasted compute. Ask: "Am I training the FINAL system, or am I training something I'm about to replace?"
+**Exception:** Small-scale fast validation runs (e.g., 500-step smoke tests) on non-final architecture ARE allowed and encouraged — you can't know if a change works without testing it. The rule prohibits full training runs (30K+ steps) on architecture you know is about to be replaced, not quick sanity checks that cost minutes.
+
+### M-049: Repo root bloated with ~650MB of unorganized artifacts
+**When:** 2026-02-21, accumulated over weeks
+**Symptom:** Repo root contains 8 safetensors checkpoints (~650MB), 6 gallery outputs, diagnostic dumps, training logs, backup tokenizer bins, and stale pipeline outputs — all dumped flat in the project root alongside source code. The root has 40+ entries when it should have ~10.
+**Root cause:** Hardcoded output paths in brain.rs (`brain_best_sft.safetensors`, `brain_checkpoint.safetensors`), main.rs (gallery writes), and training scripts all default to the project root. No `checkpoints/`, `outputs/`, or `logs/` directory structure. Every training run, gallery eval, and diagnostic adds more files to the root. Backup copies (v20, v22_backup, step13000) were created ad-hoc and never cleaned up.
+**Fix:** Create proper output directories: `checkpoints/` for safetensors, `outputs/` for gallery/diagnostic text, `logs/` for training logs. Update save paths in brain.rs and main.rs. Move existing artifacts. Add directories to .gitignore.
+**Prevention:** Output paths should NEVER default to the project root. All generated artifacts go into dedicated subdirectories. When creating backups, use timestamped names in the checkpoints dir, not ad-hoc copies in root.
+
+### M-050: Failed to parallelize independent work (tests + formatting fix)
+**When:** 2026-02-21, during RoPE prefix fix
+**Symptom:** Ran `cargo test` in foreground, blocking main context from fixing bg-agent.md formatting (a completely independent task). Tests took minutes; formatting fix took seconds. Could have done both simultaneously.
+**Root cause:** Sequential-by-default thinking. Defaulted to waiting for test results before doing anything else, even though the next task had zero dependency on the tests.
+**Fix:** Backgrounded the tests after Lain pointed it out.
+**Prevention:** Before running any long command (tests, builds, training): ask "is there independent work I can do while this runs?" If yes, background the long command and do the independent work immediately. Tests and formatting fixes are NEVER dependent on each other.
+
+### M-051: Blocked on test output instead of continuing next task
+**When:** 2026-02-21, after RoPE prefix fix
+**Symptom:** Tests running in background. Instead of immediately starting the next task (YaRN implementation), used `TaskOutput` with `block=true` — literally doing nothing while waiting for tests to finish.
+**Root cause:** Same sequential-by-default thinking as M-050. Treated test completion as a gate for ALL work, when it's only a gate for marking task #18 complete. YaRN implementation has zero dependency on test results.
+**Fix:** Start YaRN immediately. Check test results later.
+**Prevention:** NEVER block on background tasks unless you literally cannot proceed without the result. If the next task is independent, START IT. Check bg results opportunistically between steps, not as a blocking gate.
+
+### M-052: BRAIN_ONLY mode skips tokenizer save → garbled gallery output
+**When:** 2026-02-21, v24 training
+**Symptom:** v24 training (val_loss=1.95, 30K steps, BRAIN_ONLY=1) produced garbled gallery output: "hmak theorre pal d tsss..." every single prompt. Zero coherent responses despite good loss numbers. The mid-training diagnostic at step 7500 showed ACTUAL ENGLISH WORDS.
+**Root cause:** TWO compounding bugs:
+1. `BRAIN_ONLY` mode exits (`return Ok(())`) at main.rs:346, BEFORE the tokenizer save at main.rs:349. The ConceptTokenizer built in-memory during training is never persisted to disk.
+2. `discover_merges()` in tokenizer.rs uses `HashMap<Vec<u8>, usize>` for n-gram frequency counting. HashMap iteration order is random (SipHash default). When n-grams tie on score, their relative order — and thus their token IDs — varies between runs. The tokenizer is NON-DETERMINISTIC.
+Combined: v24 trained with tokenizer T1 (random merge ordering, never saved). Gallery loaded tokenizer T2 (stale file from earlier run, different merge ordering). Token ID 260 means "the" in T1 but "and" in T2. Every generated token is decoded to the wrong string → word soup.
+**Fix:** (1) Move tokenizer save before BRAIN_ONLY exit. (2) Make discover_merges deterministic: sort candidates by (score DESC, pattern bytes ASC) to break ties consistently.
+**Prevention:** Tokenizer save checklist item: after any training mode change, verify the tokenizer is persisted before exit. Add to prevention checklist. Test: build tokenizer twice from same corpus, assert identical merge tables.
+
+### M-053: Failed to save task state before context compaction
+**When:** 2026-02-21, during JARVIS race
+**Symptom:** Context compacted mid-session without current task state being captured in todos or PROJECT_STATE.md. Recovery required extensive re-reading of code and logs to reconstruct what was happening.
+**Root cause:** Did not proactively update todos with sufficient detail as work progressed. The todo list had high-level phase descriptions but no specific current-step context (e.g., "investigating v24 gallery garbling, suspect cross-attn or tokenizer mismatch").
+**Fix:** Update todos with specific current state BEFORE compaction triggers (proactively at ~50-60% context usage), and definitely as work progresses through sub-steps.
+**Prevention:** After each significant discovery or state change, immediately update the relevant todo item's description. Use TaskUpdate to capture WHERE you are in a multi-step investigation, not just THAT you're investigating.

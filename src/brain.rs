@@ -163,7 +163,7 @@ impl BrainConfig {
             max_noise_rate: 0.10,
             early_stop_sft: 0.0,  // v16: disabled — val loss + patience handles stopping
             early_stop_da: 5e-3,
-            early_stop_patience: 5, // v20: stricter early stopping (was 10)
+            early_stop_patience: 20, // v24: increased from 5 — 100-sample val_loss plateaus are noisy false signals
             decoder_vocab_size: TALK_VOCAB_SIZE, // default: byte-level (override with ConceptTokenizer vocab)
             dropout: 0.1, // v20: decoder dropout to prevent overfitting
             grad_accum_steps: 1, // no accumulation at d=512 (batch=48 fits in VRAM)
@@ -459,8 +459,8 @@ pub struct Brain {
     concept_encoder: WiredTransformer,
     concept_projector: Linear,
     memory_projector: Linear,
-    language_decoder: WiredTransformer,
-    memory_bank: MemoryBank,
+    pub language_decoder: WiredTransformer,
+    pub memory_bank: MemoryBank,
     pub config: BrainConfig,
     // --- Policy ---
     policy_backbone: WiredTransformer,
@@ -496,7 +496,9 @@ impl Brain {
             d_ff: config.d_ff,
             vocab_size: TALK_VOCAB_SIZE,
             max_seq_len: config.encoder_seq_len,
+            max_train_len: config.encoder_seq_len,
             dropout: 0.0, // encoder is 1 layer, dropout not needed
+            use_cross_attn: false,
         };
         let concept_encoder = WiredTransformer::from_vb(enc_cfg, vb.pp("enc"), device)?;
 
@@ -517,7 +519,9 @@ impl Brain {
             d_ff: config.d_ff,
             vocab_size: config.decoder_vocab_size,
             max_seq_len: config.total_decoder_seq(),
+            max_train_len: config.decoder_seq_len,
             dropout: config.dropout,
+            use_cross_attn: true, // decoder always has cross-attn for memory
         };
         let language_decoder = WiredTransformer::from_vb(dec_cfg, vb.pp("dec"), device)?;
 
@@ -531,7 +535,9 @@ impl Brain {
             d_ff: policy_cfg.d_ff,
             vocab_size: BYTE_VOCAB,
             max_seq_len: policy_cfg.seq_len,
+            max_train_len: policy_cfg.seq_len,
             dropout: 0.0, // policy doesn't need dropout (task is easier)
+            use_cross_attn: false,
         };
         let policy_backbone = WiredTransformer::from_vb(pol_tcfg, vb.pp("pol_backbone"), device)?;
 
@@ -575,7 +581,7 @@ impl Brain {
         Ok(projected.reshape((batch, self.config.n_concept_tokens, self.config.d_model))?)
     }
 
-    fn build_prefix(
+    pub fn build_prefix(
         &self,
         concept_vec: &Tensor,
         memory_vecs: Option<&Tensor>,
@@ -613,6 +619,7 @@ impl Brain {
     }
 
     /// Training variant with dropout enabled on the decoder.
+    /// Memory is routed through cross-attention layers, not the prefix.
     pub fn forward_from_concept_t(
         &self,
         concept_vec: &Tensor,
@@ -620,8 +627,12 @@ impl Brain {
         memory_vecs: Option<&Tensor>,
         train: bool,
     ) -> Result<Tensor> {
-        let prefix = self.build_prefix(concept_vec, memory_vecs)?;
-        self.language_decoder.forward_with_prefix_t(&prefix, response_ids, train)
+        let prefix = self.build_prefix(concept_vec, None)?; // concept-only prefix
+        let memory = match memory_vecs {
+            Some(mem) => Some(self.memory_projector.forward(mem)?),
+            None => None,
+        };
+        self.language_decoder.forward_with_prefix_t(&prefix, response_ids, train, memory.as_ref())
     }
 
     pub fn forward_with_memory(
@@ -635,8 +646,9 @@ impl Brain {
         let cv = concept_vec.squeeze(0)?.to_vec1::<f32>()?;
         let memories = self.memory_bank.retrieve_vecs(&cv, self.config.memory_k);
 
-        let prefix = if memories.is_empty() {
-            self.build_prefix(&concept_vec, None)?
+        let prefix = self.build_prefix(&concept_vec, None)?; // concept-only prefix
+        let memory = if memories.is_empty() {
+            None
         } else {
             let mem_data: Vec<f32> = memories.iter()
                 .flat_map(|m| m.iter().copied())
@@ -645,10 +657,10 @@ impl Brain {
             let mem_tensor = Tensor::from_vec(
                 mem_data, (1, n_mems, self.config.d_model), device,
             )?;
-            self.build_prefix(&concept_vec, Some(&mem_tensor))?
+            Some(self.memory_projector.forward(&mem_tensor)?)
         };
 
-        self.language_decoder.forward_with_prefix(&prefix, response_ids)
+        self.language_decoder.forward_with_prefix_t(&prefix, response_ids, false, memory.as_ref())
     }
 
     pub fn store_memory(&mut self, concept_vec: Vec<f32>, response: String) {
@@ -906,13 +918,13 @@ pub fn train_brain_talk(
         EarlyStopping::new(
             0.0, // no fixed threshold — purely patience-based on val loss
             config.early_stop_patience,
-            if save_ckpt { Some("brain_best_sft.safetensors".to_string()) } else { None },
+            if save_ckpt { Some("checkpoints/brain_best_sft.safetensors".to_string()) } else { None },
         ).with_stale_stop()
     } else {
         EarlyStopping::new(
             config.early_stop_sft,
             config.early_stop_patience,
-            if save_ckpt && config.early_stop_sft > 0.0 { Some("brain_best_sft.safetensors".to_string()) } else { None },
+            if save_ckpt && config.early_stop_sft > 0.0 { Some("checkpoints/brain_best_sft.safetensors".to_string()) } else { None },
         )
     };
 
@@ -1100,7 +1112,7 @@ pub fn train_brain_talk(
 
             // Compute validation loss if val data available
             let (stop_loss, val_str) = if use_val && !val_data.is_empty() {
-                let vl = compute_val_loss(&brain, &val_data, enc_seq, dec_seq, 100, device)?;
+                let vl = compute_val_loss(&brain, &val_data, enc_seq, dec_seq, val_data.len(), device)?;
                 (vl, format!(" val_loss={vl:.4}"))
             } else {
                 (avg, String::new())
@@ -1127,6 +1139,13 @@ pub fn train_brain_talk(
     }
 
     trainer.print_timer("brain-sft-v14");
+
+    // Restore best checkpoint weights (training may have overshot past the best val_loss)
+    if save_ckpt && std::path::Path::new("checkpoints/brain_best_sft.safetensors").exists() {
+        crate::training::load_checkpoint(&varmap, "checkpoints/brain_best_sft.safetensors", device)?;
+        eprintln!("[brain] Restored best checkpoint (val_loss={:.4} at step {})",
+            early_stop.best_loss(), early_stop.best_step());
+    }
 
     // Post-SFT encoder diagnostics
     if total_steps >= 1000 {
@@ -1594,6 +1613,7 @@ fn brain_finetune_dialogue_aligned(
 // Generation
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]  // Kept for comparison; superseded by apply_ngram_penalty
 fn apply_repetition_penalty(logits: &mut [f32], generated: &[u32], penalty: f32, window: usize) {
     if penalty <= 1.0 { return; }
     let start = if window > 0 && generated.len() > window {
@@ -1612,6 +1632,41 @@ fn apply_repetition_penalty(logits: &mut [f32], generated: &[u32], penalty: f32,
                 logits[id as usize] /= p;
             } else {
                 logits[id as usize] *= p;
+            }
+        }
+    }
+}
+
+/// N-gram repetition penalty: penalizes tokens that would create a repeated
+/// N-gram (sequence of N tokens). Unlike token-level penalty, this only fires
+/// when the same SEQUENCE appears twice — individual token reuse is allowed.
+/// Critical for byte-level tokenizers where characters like 'e', 'o', ' '
+/// naturally repeat throughout any text.
+fn apply_ngram_penalty(logits: &mut [f32], generated: &[u32], penalty: f32, ngram_size: usize) {
+    if penalty <= 1.0 || generated.len() < ngram_size { return; }
+    let context_len = ngram_size - 1;
+    if generated.len() < context_len { return; }
+
+    // Current context: the last (N-1) tokens
+    let current_context = &generated[generated.len() - context_len..];
+
+    // Find all tokens that previously followed this exact context
+    let mut seen_next = std::collections::HashSet::<u32>::new();
+    for i in 0..generated.len().saturating_sub(context_len) {
+        if generated[i..i + context_len] == *current_context
+            && i + context_len < generated.len()
+        {
+            seen_next.insert(generated[i + context_len]);
+        }
+    }
+
+    // Penalize those tokens — choosing them would create a repeated N-gram
+    for &next_id in &seen_next {
+        if (next_id as usize) < logits.len() {
+            if logits[next_id as usize] > 0.0 {
+                logits[next_id as usize] /= penalty;
+            } else {
+                logits[next_id as usize] *= penalty;
             }
         }
     }
@@ -1670,18 +1725,20 @@ pub fn brain_generate(
 ) -> Result<String> {
     let enc_tok = TalkTokenizer;
     let enc_seq = brain.config.encoder_seq_len;
-    let dec_seq = brain.config.decoder_seq_len;
 
     let goal_ids = enc_tok.encode(prompt);
     let goal_padded = enc_tok.pad_or_truncate(&goal_ids, enc_seq);
     let goal_tensor = Tensor::from_vec(goal_padded, (1, enc_seq), device)?;
 
     let concept_vec = brain.encode_concept(&goal_tensor)?;
-    let prefix = if use_memory {
+    let prefix = brain.build_prefix(&concept_vec, None)?; // concept-only prefix
+
+    // Memory goes through cross-attention, not prefix
+    let memory = if use_memory {
         let cv = concept_vec.squeeze(0)?.to_vec1::<f32>()?;
         let memories = brain.memory_bank.retrieve_vecs(&cv, brain.config.memory_k);
         if memories.is_empty() {
-            brain.build_prefix(&concept_vec, None)?
+            None
         } else {
             let mem_data: Vec<f32> = memories.iter()
                 .flat_map(|m| m.iter().copied())
@@ -1690,46 +1747,87 @@ pub fn brain_generate(
             let mem_tensor = Tensor::from_vec(
                 mem_data, (1, n_mems, brain.config.d_model), device,
             )?;
-            brain.build_prefix(&concept_vec, Some(&mem_tensor))?
+            Some(brain.memory_projector.forward(&mem_tensor)?)
         }
     } else {
-        brain.build_prefix(&concept_vec, None)?
+        None
     };
 
     let mut generated: Vec<u32> = vec![TOK_BOS];
-    let rep_penalty = 1.3_f32;
-    let rep_window = 50_usize;
-    let top_k = 40_usize;
-    let top_p = 0.9_f32;
+    let ngram_penalty = std::env::var("GESTALT_NGRAM_PENALTY")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(2.0_f32);
+    let ngram_size = std::env::var("GESTALT_NGRAM_SIZE")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(4_usize);
+    let top_k = std::env::var("GESTALT_TOP_K")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(40_usize);
+    let top_p = std::env::var("GESTALT_TOP_P")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(0.9_f32);
 
-    for _ in 0..max_tokens {
-        let padded = right_pad(&generated, dec_seq);
-        let input = Tensor::from_vec(padded, (1, dec_seq), device)?;
+    // KV cache: one entry per decoder layer
+    let mut kv_caches: Vec<Option<(Tensor, Tensor)>> = vec![None; brain.language_decoder.n_layers()];
 
-        let logits = brain.language_decoder.forward_with_prefix(&prefix, &input)?;
+    // Prefill step: process [prefix + BOS] and cache all K/V
+    let bos_tensor = Tensor::from_vec(vec![TOK_BOS], (1, 1), device)?;
+    let logits = brain.language_decoder.forward_with_prefix_cached(
+        &prefix, &bos_tensor, &mut kv_caches, memory.as_ref(),
+    )?;
 
-        let read_pos = generated.len() - 1;
-        let mut next_logits = logits.i((0, read_pos))?.to_vec1::<f32>()?;
+    let mut next_logits = logits.i((0, 0))?.to_vec1::<f32>()?;
+    apply_ngram_penalty(&mut next_logits, &generated, ngram_penalty, ngram_size);
+    if temperature >= 0.01 {
+        let temp = temperature as f32;
+        for l in next_logits.iter_mut() { *l /= temp; }
+    }
+    apply_top_k(&mut next_logits, top_k);
+    apply_top_p(&mut next_logits, top_p);
+    if (TOK_PAD as usize) < next_logits.len() {
+        next_logits[TOK_PAD as usize] = f32::NEG_INFINITY;
+    }
+    let next_id = if temperature < 0.01 {
+        next_logits.iter().enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i as u32)
+            .unwrap_or(TOK_EOS)
+    } else {
+        sample_with_temperature(&next_logits, 1.0)
+    };
 
-        apply_repetition_penalty(&mut next_logits, &generated, rep_penalty, rep_window);
-        apply_top_k(&mut next_logits, top_k);
-        apply_top_p(&mut next_logits, top_p);
-
-        if (TOK_PAD as usize) < next_logits.len() {
-            next_logits[TOK_PAD as usize] = f32::NEG_INFINITY;
-        }
-
-        let next_id = if temperature < 0.01 {
-            next_logits.iter().enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                .map(|(i, _)| i as u32)
-                .unwrap_or(TOK_EOS)
-        } else {
-            sample_with_temperature(&next_logits, temperature)
-        };
-
-        if next_id == TOK_EOS { break; }
+    if next_id != TOK_EOS {
         generated.push(next_id);
+
+        // Autoregressive steps: single token at a time with KV cache
+        for _ in 1..max_tokens {
+            let token_tensor = Tensor::from_vec(vec![*generated.last().unwrap()], (1, 1), device)?;
+            // RoPE offset = text position only (prefix has no RoPE positions)
+            let seq_offset = generated.len() - 1;
+            let logits = brain.language_decoder.forward_step_cached(
+                &token_tensor, seq_offset, &mut kv_caches, memory.as_ref(),
+            )?;
+
+            let mut next_logits = logits.i((0, 0))?.to_vec1::<f32>()?;
+            apply_ngram_penalty(&mut next_logits, &generated, ngram_penalty, ngram_size);
+            if temperature >= 0.01 {
+                let temp = temperature as f32;
+                for l in next_logits.iter_mut() { *l /= temp; }
+            }
+            apply_top_k(&mut next_logits, top_k);
+            apply_top_p(&mut next_logits, top_p);
+            if (TOK_PAD as usize) < next_logits.len() {
+                next_logits[TOK_PAD as usize] = f32::NEG_INFINITY;
+            }
+
+            let next_id = if temperature < 0.01 {
+                next_logits.iter().enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .map(|(i, _)| i as u32)
+                    .unwrap_or(TOK_EOS)
+            } else {
+                sample_with_temperature(&next_logits, 1.0)
+            };
+
+            if next_id == TOK_EOS { break; }
+            generated.push(next_id);
+        }
     }
 
     let response_ids = &generated[1..];
@@ -2091,7 +2189,9 @@ pub fn train_and_bench(cfg: &PolicyConfig, device: &Device) -> Result<(usize, us
         d_ff: cfg.d_ff,
         vocab_size: BYTE_VOCAB,
         max_seq_len: cfg.seq_len,
+        max_train_len: cfg.seq_len,
         dropout: 0.0,
+        use_cross_attn: false,
     };
     let backbone = WiredTransformer::from_vb(tcfg, vb.pp("backbone"), device)?;
 
@@ -2115,7 +2215,7 @@ pub fn train_and_bench(cfg: &PolicyConfig, device: &Device) -> Result<(usize, us
     let mut early_stop = EarlyStopping::new(
         cfg.early_stop_loss,
         cfg.early_stop_patience,
-        if cfg.early_stop_loss > 0.0 { Some("policy_best.safetensors".to_string()) } else { None },
+        if cfg.early_stop_loss > 0.0 { Some("checkpoints/policy_best.safetensors".to_string()) } else { None },
     );
     let mut recent_losses: Vec<f32> = Vec::new();
 
@@ -2452,7 +2552,9 @@ mod tests {
             d_ff: cfg.d_ff,
             vocab_size: BYTE_VOCAB,
             max_seq_len: cfg.seq_len,
+            max_train_len: cfg.seq_len,
             dropout: 0.0,
+            use_cross_attn: false,
         };
         let backbone = WiredTransformer::from_vb(tcfg, vb.pp("backbone"), &device)?;
 

@@ -396,7 +396,9 @@ pub fn train_sft(
         d_ff: config.d_ff,
         vocab_size,
         max_seq_len: config.max_seq_len,
+        max_train_len: config.max_seq_len,
         dropout: 0.0, // planner doesn't need dropout (21 goals, always converges)
+        use_cross_attn: false,
     };
 
     let varmap = VarMap::new();
@@ -454,7 +456,7 @@ pub fn train_sft(
     let mut early_stop = EarlyStopping::new(
         config.early_stop_loss,
         config.early_stop_patience,
-        if config.early_stop_loss > 0.0 { Some("planner_best.safetensors".to_string()) } else { None },
+        if config.early_stop_loss > 0.0 { Some("checkpoints/planner_best.safetensors".to_string()) } else { None },
     );
 
     for step in 0..config.sft_steps {
@@ -684,7 +686,9 @@ mod tests {
             d_ff: 128,
             vocab_size: tok.vocab_size(),
             max_seq_len: 64,
+            max_train_len: 64,
             dropout: 0.0,
+            use_cross_attn: false,
         };
         let varmap = VarMap::new();
         let model = WiredTransformer::new(config, &varmap, &device)?;

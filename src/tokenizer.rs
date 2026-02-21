@@ -633,7 +633,14 @@ impl ConceptTokenizer {
         eprintln!("[tokenizer] {} candidates above min_freq={}", candidates.len(), min_frequency);
 
         // Phase 3: Sort descending by score, take top-K.
-        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Sort by (score DESC, pattern bytes ASC) for determinism (M-052).
+        // HashMap iteration order is random; without a stable tiebreaker,
+        // equal-scored n-grams get random token IDs across runs.
+        candidates.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         candidates.truncate(max_merges);
 
         // Phase 4: Assign token IDs starting at CONCEPT_BASE_VOCAB.

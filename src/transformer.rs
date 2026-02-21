@@ -71,9 +71,18 @@ pub struct TransformerConfig {
     pub d_ff: usize,
     pub vocab_size: usize,
     pub max_seq_len: usize,
+    /// Max sequence length seen during training (for YaRN context extension).
+    /// When inference seq > max_train_len, YaRN frequency-selective RoPE scaling activates.
+    #[serde(default = "default_max_train_len")]
+    pub max_train_len: usize,
     #[serde(default)]
     pub dropout: f64,
+    /// Enable cross-attention layers for external memory (decoder only).
+    #[serde(default)]
+    pub use_cross_attn: bool,
 }
+
+fn default_max_train_len() -> usize { 256 }
 
 impl TransformerConfig {
     /// Phase 0-1 default: d=512, 4 layers, 8 heads.
@@ -85,7 +94,9 @@ impl TransformerConfig {
             d_ff: 2048,
             vocab_size: 373,
             max_seq_len: 256,
+            max_train_len: 256,
             dropout: 0.0,
+            use_cross_attn: false,
         }
     }
 
@@ -98,7 +109,9 @@ impl TransformerConfig {
             d_ff: 128,
             vocab_size: 32,
             max_seq_len: 16,
+            max_train_len: 16,
             dropout: 0.0,
+            use_cross_attn: false,
         }
     }
 
@@ -111,22 +124,72 @@ impl TransformerConfig {
 // RoPE
 // ---------------------------------------------------------------------------
 
+/// Precompute RoPE cos/sin tables with YaRN context extension.
+///
+/// When `seq_len <= max_train_len`, standard RoPE (base=10000).
+/// When `seq_len > max_train_len`, YaRN frequency-selective scaling:
+///   - High-freq dims (wavelength < train_len): unchanged (local relationships preserved)
+///   - Low-freq dims (wavelength > train_len * beta): NTK-scaled (global relationships stretched)
+///   - Mid-freq dims: linear ramp between the two
+///
+/// Returns (cos, sin) tables of shape (seq_len, head_dim/2).
+/// Also returns the attention temperature factor for entropy compensation.
 fn precompute_rope(
     seq_len: usize,
     head_dim: usize,
+    max_train_len: usize,
     device: &Device,
-) -> Result<(Tensor, Tensor)> {
+) -> Result<(Tensor, Tensor, f32)> {
     let half = head_dim / 2;
-    let theta: Vec<f32> = (0..half)
-        .map(|i| 1.0f32 / 10000f32.powf(2.0 * i as f32 / head_dim as f32))
-        .collect();
+    let scale = seq_len as f32 / max_train_len as f32;
+
+    let theta: Vec<f32> = if seq_len > max_train_len {
+        // YaRN: frequency-selective scaling
+        let beta = 2.0f32; // transition band width
+        // NTK-scaled base for low-frequency dimensions
+        let base_scaled = 10000.0f32 * scale.powf(head_dim as f32 / (head_dim as f32 - 2.0));
+
+        (0..half)
+            .map(|i| {
+                let freq_orig = 1.0f32 / 10000f32.powf(2.0 * i as f32 / head_dim as f32);
+                let freq_scaled = 1.0f32 / base_scaled.powf(2.0 * i as f32 / head_dim as f32);
+                let wavelength = 2.0 * std::f32::consts::PI / freq_orig;
+
+                if wavelength < max_train_len as f32 {
+                    // High frequency: preserve local relationships
+                    freq_orig
+                } else if wavelength > max_train_len as f32 * beta {
+                    // Low frequency: full NTK scaling
+                    freq_scaled
+                } else {
+                    // Mid frequency: linear ramp
+                    let t = (wavelength - max_train_len as f32)
+                        / (max_train_len as f32 * (beta - 1.0));
+                    freq_orig * (1.0 - t) + freq_scaled * t
+                }
+            })
+            .collect()
+    } else {
+        // Standard RoPE
+        (0..half)
+            .map(|i| 1.0f32 / 10000f32.powf(2.0 * i as f32 / head_dim as f32))
+            .collect()
+    };
+
+    // Attention temperature: sqrt(L_test / L_train) to compensate for entropy explosion
+    let attn_temp = if seq_len > max_train_len {
+        scale.sqrt()
+    } else {
+        1.0
+    };
+
     let theta = Tensor::new(theta, device)?;
     let positions: Vec<f32> = (0..seq_len).map(|p| p as f32).collect();
     let positions = Tensor::new(positions, device)?;
     let freqs = positions.unsqueeze(1)?.matmul(&theta.unsqueeze(0)?)?;
     let cos = freqs.cos()?;
     let sin = freqs.sin()?;
-    Ok((cos, sin))
+    Ok((cos, sin, attn_temp))
 }
 
 fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
@@ -171,7 +234,10 @@ impl Attention {
         })
     }
 
-    fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    /// `n_prefix`: number of leading positions that are prefix tokens (no RoPE applied).
+    /// Text tokens receive RoPE starting at position 0.
+    /// `attn_temp`: YaRN attention temperature (1.0 during training, sqrt(L/L_train) for extension).
+    fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, causal_mask: &Tensor, n_prefix: usize, attn_temp: f32) -> Result<Tensor> {
         let (b, s, _d) = x.dims3()?;
         let q = self.q_proj.forward(x)?;
         let k = self.k_proj.forward(x)?;
@@ -190,14 +256,117 @@ impl Attention {
             .transpose(1, 2)?
             .contiguous()?;
 
-        let q = apply_rope(&q, cos, sin)?;
-        let k = apply_rope(&k, cos, sin)?;
+        // Apply RoPE only to text tokens (skip prefix positions)
+        let (q, k) = if n_prefix > 0 && n_prefix < s {
+            let n_text = s - n_prefix;
+            let q_prefix = q.narrow(2, 0, n_prefix)?;
+            let q_text = q.narrow(2, n_prefix, n_text)?;
+            let k_prefix = k.narrow(2, 0, n_prefix)?;
+            let k_text = k.narrow(2, n_prefix, n_text)?;
+            let q_text = apply_rope(&q_text, cos, sin)?;
+            let k_text = apply_rope(&k_text, cos, sin)?;
+            // .contiguous() required after cat — candle matmul needs contiguous tensors
+            (Tensor::cat(&[&q_prefix, &q_text], 2)?.contiguous()?,
+             Tensor::cat(&[&k_prefix, &k_text], 2)?.contiguous()?)
+        } else {
+            (apply_rope(&q, cos, sin)?, apply_rope(&k, cos, sin)?)
+        };
 
-        let scale = (self.head_dim as f64).sqrt();
+        // YaRN attention temperature: divide logits by sqrt(d) * sqrt(L/L_train)
+        // to compensate for entropy explosion at longer sequences
+        let scale = (self.head_dim as f64).sqrt() * attn_temp as f64;
         let attn = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
         let attn = (attn / scale)?;
 
-        let mask = build_causal_mask(s, x.device())?;
+        // Slice cached causal mask to actual seq_len (avoids per-call allocation + H2D)
+        let mask = causal_mask.narrow(2, 0, s)?.narrow(3, 0, s)?;
+        let attn = attn.broadcast_add(&mask)?;
+        let attn = grad_softmax_last_dim(&attn)?;
+
+        let out = attn.matmul(&v)?;
+        let out = out
+            .transpose(1, 2)?
+            .reshape((b, s, self.n_heads * self.head_dim))?;
+        self.o_proj.forward(&out).map_err(Into::into)
+    }
+
+    /// Cached forward for autoregressive generation.
+    /// `seq_offset`: RoPE position of first TEXT token in `x` (prefix tokens get no RoPE).
+    /// `n_prefix`: number of leading positions that are prefix (no RoPE). 0 for step calls.
+    /// `kv_cache`: mutable cache of past (K, V) tensors. Updated in place.
+    fn forward_cached(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        seq_offset: usize,
+        n_prefix: usize,
+        attn_temp: f32,
+        kv_cache: &mut Option<(Tensor, Tensor)>,
+    ) -> Result<Tensor> {
+        let (b, s, _d) = x.dims3()?;
+        let q = self.q_proj.forward(x)?;
+        let k = self.k_proj.forward(x)?;
+        let v = self.v_proj.forward(x)?;
+
+        let q = q
+            .reshape((b, s, self.n_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k = k
+            .reshape((b, s, self.n_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let v = v
+            .reshape((b, s, self.n_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        // Apply RoPE only to text tokens (skip prefix positions)
+        let (q, k) = if n_prefix > 0 && n_prefix < s {
+            let n_text = s - n_prefix;
+            let cos_slice = cos.narrow(0, seq_offset, n_text)?;
+            let sin_slice = sin.narrow(0, seq_offset, n_text)?;
+            let q_prefix = q.narrow(2, 0, n_prefix)?;
+            let q_text = apply_rope(&q.narrow(2, n_prefix, n_text)?, &cos_slice, &sin_slice)?;
+            let k_prefix = k.narrow(2, 0, n_prefix)?;
+            let k_text = apply_rope(&k.narrow(2, n_prefix, n_text)?, &cos_slice, &sin_slice)?;
+            // .contiguous() required after cat — candle matmul needs contiguous tensors
+            (Tensor::cat(&[&q_prefix, &q_text], 2)?.contiguous()?,
+             Tensor::cat(&[&k_prefix, &k_text], 2)?.contiguous()?)
+        } else {
+            // No prefix (step calls) or all prefix — apply RoPE to all
+            let cos_slice = cos.narrow(0, seq_offset, s)?;
+            let sin_slice = sin.narrow(0, seq_offset, s)?;
+            (apply_rope(&q, &cos_slice, &sin_slice)?, apply_rope(&k, &cos_slice, &sin_slice)?)
+        };
+
+        // Concat with cached K/V
+        let (k, v) = if let Some((past_k, past_v)) = kv_cache.take() {
+            (Tensor::cat(&[&past_k, &k], 2)?, Tensor::cat(&[&past_v, &v], 2)?)
+        } else {
+            (k, v)
+        };
+        *kv_cache = Some((k.clone(), v.clone()));
+
+        let scale = (self.head_dim as f64).sqrt() * attn_temp as f64;
+        let attn = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
+        let attn = (attn / scale)?;
+
+        // Causal mask for cached generation.
+        let kv_len = attn.dim(D::Minus1)?;
+        let mask = if s == 1 {
+            // Single-token step: attend to all cached entries (this token is always the latest).
+            Tensor::zeros((1, 1, 1, kv_len), DType::F32, x.device())?
+        } else {
+            // Prefill: standard causal mask. Position i attends to positions 0..=i.
+            let mask_data: Vec<f32> = (0..s)
+                .flat_map(|qi| {
+                    (0..kv_len).map(move |kj| if kj <= qi { 0.0f32 } else { f32::NEG_INFINITY })
+                })
+                .collect();
+            Tensor::from_vec(mask_data, (1, 1, s, kv_len), x.device())?
+        };
         let attn = attn.broadcast_add(&mask)?;
         let attn = grad_softmax_last_dim(&attn)?;
 
@@ -242,12 +411,73 @@ impl Mlp {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-Attention (for external memory)
+// ---------------------------------------------------------------------------
+
+struct CrossAttention {
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    o_proj: Linear,
+    n_heads: usize,
+    head_dim: usize,
+}
+
+impl CrossAttention {
+    fn new(cfg: &TransformerConfig, vb: VarBuilder) -> Result<Self> {
+        let d = cfg.d_model;
+        Ok(Self {
+            q_proj: linear_no_bias(d, d, vb.pp("q_proj"))?,
+            k_proj: linear_no_bias(d, d, vb.pp("k_proj"))?,
+            v_proj: linear_no_bias(d, d, vb.pp("v_proj"))?,
+            o_proj: linear_no_bias(d, d, vb.pp("o_proj"))?,
+            n_heads: cfg.n_heads,
+            head_dim: cfg.head_dim(),
+        })
+    }
+
+    /// Cross-attention: Q from hidden states, K/V from external memory.
+    /// No causal mask (memory is fully visible). No RoPE (memory has no position).
+    fn forward(&self, x: &Tensor, memory: &Tensor) -> Result<Tensor> {
+        let (b, s, _d) = x.dims3()?;
+        let m = memory.dim(1)?; // number of memory entries
+
+        let q = self.q_proj.forward(x)?
+            .reshape((b, s, self.n_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k = self.k_proj.forward(memory)?
+            .reshape((b, m, self.n_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let v = self.v_proj.forward(memory)?
+            .reshape((b, m, self.n_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        let scale = (self.head_dim as f64).sqrt();
+        let attn = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
+        let attn = (attn / scale)?;
+        // No mask — full attention to all memory entries
+        let attn = grad_softmax_last_dim(&attn)?;
+
+        let out = attn.matmul(&v)?;
+        let out = out
+            .transpose(1, 2)?
+            .reshape((b, s, self.n_heads * self.head_dim))?;
+        self.o_proj.forward(&out).map_err(Into::into)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Transformer Block
 // ---------------------------------------------------------------------------
 
 struct TransformerBlock {
     attn_norm: GradRmsNorm,
     attn: Attention,
+    cross_attn_norm: Option<GradRmsNorm>,
+    cross_attn: Option<CrossAttention>,
     mlp_norm: GradRmsNorm,
     mlp: Mlp,
     dropout: f64,
@@ -255,21 +485,60 @@ struct TransformerBlock {
 
 impl TransformerBlock {
     fn new(cfg: &TransformerConfig, vb: VarBuilder) -> Result<Self> {
+        let (cross_attn_norm, cross_attn) = if cfg.use_cross_attn {
+            (
+                Some(GradRmsNorm::new(cfg.d_model, 1e-6, vb.pp("cross_attn_norm"))?),
+                Some(CrossAttention::new(cfg, vb.pp("cross_attn"))?),
+            )
+        } else {
+            (None, None)
+        };
         Ok(Self {
             attn_norm: GradRmsNorm::new(cfg.d_model, 1e-6, vb.pp("attn_norm"))?,
             attn: Attention::new(cfg, vb.pp("attn"))?,
+            cross_attn_norm,
+            cross_attn,
             mlp_norm: GradRmsNorm::new(cfg.d_model, 1e-6, vb.pp("mlp_norm"))?,
             mlp: Mlp::new(cfg.d_model, cfg.d_ff, vb.pp("mlp"))?,
             dropout: cfg.dropout,
         })
     }
 
-    fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, train: bool) -> Result<Tensor> {
-        let h = self.attn.forward(&self.attn_norm.forward(x)?, cos, sin)?;
+    fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, causal_mask: &Tensor, train: bool, n_prefix: usize, attn_temp: f32, memory: Option<&Tensor>) -> Result<Tensor> {
+        let h = self.attn.forward(&self.attn_norm.forward(x)?, cos, sin, causal_mask, n_prefix, attn_temp)?;
         let h = grad_dropout(&h, self.dropout, train)?;
-        let x = (x + h)?;
+        let mut x = (x + h)?;
+        // Cross-attention to external memory (when both layers and memory exist)
+        if let (Some(norm), Some(ca), Some(mem)) = (&self.cross_attn_norm, &self.cross_attn, memory) {
+            let h = ca.forward(&norm.forward(&x)?, mem)?;
+            let h = grad_dropout(&h, self.dropout, train)?;
+            x = (x + h)?;
+        }
         let h = self.mlp.forward(&self.mlp_norm.forward(&x)?)?;
         let h = grad_dropout(&h, self.dropout, train)?;
+        (x + h).map_err(Into::into)
+    }
+
+    fn forward_cached(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        seq_offset: usize,
+        n_prefix: usize,
+        attn_temp: f32,
+        kv_cache: &mut Option<(Tensor, Tensor)>,
+        memory: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let h = self.attn.forward_cached(&self.attn_norm.forward(x)?, cos, sin, seq_offset, n_prefix, attn_temp, kv_cache)?;
+        // No dropout during inference
+        let mut x = (x + h)?;
+        // Cross-attention to external memory (when both layers and memory exist)
+        if let (Some(norm), Some(ca), Some(mem)) = (&self.cross_attn_norm, &self.cross_attn, memory) {
+            let h = ca.forward(&norm.forward(&x)?, mem)?;
+            x = (x + h)?;
+        }
+        let h = self.mlp.forward(&self.mlp_norm.forward(&x)?)?;
         (x + h).map_err(Into::into)
     }
 }
@@ -286,6 +555,9 @@ pub struct WiredTransformer {
     lm_head: Linear,
     rope_cos: Tensor,
     rope_sin: Tensor,
+    causal_mask: Tensor,
+    /// YaRN attention temperature: sqrt(seq_len / max_train_len). 1.0 when within training range.
+    attn_temp: f32,
 }
 
 impl WiredTransformer {
@@ -297,7 +569,8 @@ impl WiredTransformer {
         }
         let final_norm = GradRmsNorm::new(cfg.d_model, 1e-6, vb.pp("final_norm"))?;
         let lm_head = linear_no_bias(cfg.d_model, cfg.vocab_size, vb.pp("lm_head"))?;
-        let (rope_cos, rope_sin) = precompute_rope(cfg.max_seq_len, cfg.head_dim(), device)?;
+        let (rope_cos, rope_sin, attn_temp) = precompute_rope(cfg.max_seq_len, cfg.head_dim(), cfg.max_train_len, device)?;
+        let causal_mask = build_causal_mask(cfg.max_seq_len, device)?;
         Ok(Self {
             config: cfg,
             tok_emb,
@@ -306,6 +579,8 @@ impl WiredTransformer {
             lm_head,
             rope_cos,
             rope_sin,
+            causal_mask,
+            attn_temp,
         })
     }
 
@@ -323,7 +598,7 @@ impl WiredTransformer {
     pub fn forward_t(&self, input_ids: &Tensor, train: bool) -> Result<Tensor> {
         let mut x = self.tok_emb.forward(input_ids)?;
         for layer in &self.layers {
-            x = layer.forward(&x, &self.rope_cos, &self.rope_sin, train)?;
+            x = layer.forward(&x, &self.rope_cos, &self.rope_sin, &self.causal_mask, train, 0, self.attn_temp, None)?;
         }
         x = self.final_norm.forward(&x)?;
         self.lm_head.forward(&x).map_err(Into::into)
@@ -344,23 +619,26 @@ impl WiredTransformer {
     pub fn encode_t(&self, input_ids: &Tensor, train: bool) -> Result<Tensor> {
         let mut x = self.tok_emb.forward(input_ids)?;
         for layer in &self.layers {
-            x = layer.forward(&x, &self.rope_cos, &self.rope_sin, train)?;
+            x = layer.forward(&x, &self.rope_cos, &self.rope_sin, &self.causal_mask, train, 0, self.attn_temp, None)?;
         }
         self.final_norm.forward(&x).map_err(Into::into)
     }
 
     /// Forward with prefix (inference mode, no dropout).
     pub fn forward_with_prefix(&self, prefix: &Tensor, input_ids: &Tensor) -> Result<Tensor> {
-        self.forward_with_prefix_t(prefix, input_ids, false)
+        self.forward_with_prefix_t(prefix, input_ids, false, None)
     }
 
     /// Forward with prefix and train flag controlling dropout.
-    pub fn forward_with_prefix_t(&self, prefix: &Tensor, input_ids: &Tensor, train: bool) -> Result<Tensor> {
+    /// Prefix tokens receive NO RoPE. Text tokens get RoPE starting at position 0.
+    /// `memory`: optional external memory embeddings for cross-attention (batch, n_mem, d_model).
+    pub fn forward_with_prefix_t(&self, prefix: &Tensor, input_ids: &Tensor, train: bool, memory: Option<&Tensor>) -> Result<Tensor> {
         let tok_embs = self.tok_emb.forward(input_ids)?;
         let mut x = Tensor::cat(&[prefix, &tok_embs], 1)?;
+        let n_prefix = prefix.dim(1)?;
 
         for layer in &self.layers {
-            x = layer.forward(&x, &self.rope_cos, &self.rope_sin, train)?;
+            x = layer.forward(&x, &self.rope_cos, &self.rope_sin, &self.causal_mask, train, n_prefix, self.attn_temp, memory)?;
         }
         x = self.final_norm.forward(&x)?;
 
@@ -368,6 +646,58 @@ impl WiredTransformer {
         let seq_len = input_ids.dim(1)?;
         let token_hidden = x.narrow(1, n_prefix, seq_len)?;
         self.lm_head.forward(&token_hidden).map_err(Into::into)
+    }
+
+    /// Number of transformer layers (for initializing KV cache vec).
+    pub fn n_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Cached forward with prefix — prefill step.
+    /// Processes full [prefix + input_ids], populates KV cache, returns logits for last token only.
+    /// Prefix tokens receive NO RoPE. Text tokens get RoPE starting at position 0.
+    /// `memory`: optional external memory embeddings for cross-attention (batch, n_mem, d_model).
+    pub fn forward_with_prefix_cached(
+        &self,
+        prefix: &Tensor,
+        input_ids: &Tensor,
+        kv_caches: &mut Vec<Option<(Tensor, Tensor)>>,
+        memory: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let tok_embs = self.tok_emb.forward(input_ids)?;
+        let mut x = Tensor::cat(&[prefix, &tok_embs], 1)?;
+        let total_len = x.dim(1)?;
+        let n_prefix = prefix.dim(1)?;
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            x = layer.forward_cached(&x, &self.rope_cos, &self.rope_sin, 0, n_prefix, self.attn_temp, &mut kv_caches[i], memory)?;
+        }
+        x = self.final_norm.forward(&x)?;
+
+        // Return logits for the last token position only
+        let last_hidden = x.narrow(1, total_len - 1, 1)?;
+        self.lm_head.forward(&last_hidden).map_err(Into::into)
+    }
+
+    /// Cached forward — single token step (after prefill).
+    /// `token_id`: single token tensor (batch, 1).
+    /// `seq_offset`: RoPE position of this TEXT token (excludes prefix from position count).
+    /// `memory`: optional external memory embeddings for cross-attention (batch, n_mem, d_model).
+    pub fn forward_step_cached(
+        &self,
+        token_id: &Tensor,
+        seq_offset: usize,
+        kv_caches: &mut Vec<Option<(Tensor, Tensor)>>,
+        memory: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let mut x = self.tok_emb.forward(token_id)?;
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            // n_prefix=0: step calls are always text tokens, no prefix
+            x = layer.forward_cached(&x, &self.rope_cos, &self.rope_sin, seq_offset, 0, self.attn_temp, &mut kv_caches[i], memory)?;
+        }
+        x = self.final_norm.forward(&x)?;
+        self.lm_head.forward(&x).map_err(Into::into)
     }
 }
 
@@ -602,7 +932,7 @@ mod tests {
         let device = Device::Cpu;
         let head_dim = 8;
         let seq_len = 4;
-        let (cos, sin) = precompute_rope(seq_len, head_dim, &device)?;
+        let (cos, sin, _attn_temp) = precompute_rope(seq_len, head_dim, seq_len, &device)?;
 
         // cos/sin shape: (seq_len, head_dim/2)
         assert_eq!(cos.dims2()?, (seq_len, head_dim / 2));
@@ -699,6 +1029,73 @@ mod tests {
             last_loss < first_loss,
             "loss should decrease: {first_loss:.4} -> {last_loss:.4}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_cross_attention_forward() -> Result<()> {
+        let cfg = TransformerConfig {
+            use_cross_attn: true,
+            ..TransformerConfig::tiny()
+        };
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let model = WiredTransformer::new(cfg.clone(), &varmap, &device)?;
+
+        let batch = 2;
+        let seq = 8;
+        let n_mem = 4;
+        let input = Tensor::zeros((batch, seq), DType::U32, &device)?;
+        let memory = Tensor::randn(0f32, 1.0, (batch, n_mem, cfg.d_model), &device)?;
+
+        // Forward with memory
+        let logits_mem = model.forward_with_prefix_t(
+            &Tensor::randn(0f32, 1.0, (batch, 2, cfg.d_model), &device)?,
+            &input, false, Some(&memory),
+        )?;
+        assert_eq!(logits_mem.dims3()?, (batch, seq, cfg.vocab_size));
+
+        // Forward without memory (same model)
+        let logits_no_mem = model.forward_with_prefix_t(
+            &Tensor::randn(0f32, 1.0, (batch, 2, cfg.d_model), &device)?,
+            &input, false, None,
+        )?;
+        assert_eq!(logits_no_mem.dims3()?, (batch, seq, cfg.vocab_size));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_cross_attention_grads() -> Result<()> {
+        let cfg = TransformerConfig {
+            use_cross_attn: true,
+            ..TransformerConfig::tiny()
+        };
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let model = WiredTransformer::new(cfg.clone(), &varmap, &device)?;
+
+        let batch = 2;
+        let seq = 8;
+        let n_mem = 4;
+        let prefix = Tensor::randn(0f32, 1.0, (batch, 2, cfg.d_model), &device)?;
+        let input = Tensor::zeros((batch, seq), DType::U32, &device)?;
+        let targets = Tensor::zeros((batch, seq), DType::U32, &device)?;
+        let memory = Tensor::randn(0f32, 1.0, (batch, n_mem, cfg.d_model), &device)?;
+
+        let logits = model.forward_with_prefix_t(&prefix, &input, true, Some(&memory))?;
+        let loss = cross_entropy_loss(&logits, &targets)?;
+        let grads = loss.backward()?;
+
+        // Cross-attention params should get gradients
+        let mut cross_attn_grads = 0;
+        for var in varmap.all_vars() {
+            if grads.get(var.as_tensor()).is_some() {
+                cross_attn_grads += 1;
+            }
+        }
+        // With cross_attn, we should have more params than without
+        assert!(cross_attn_grads > 0, "no gradients found");
         Ok(())
     }
 }

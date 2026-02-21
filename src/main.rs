@@ -11,19 +11,22 @@
 
 use gestalt::brain::{
     Brain, BrainConfig, PolicyConfig, TalkTokenizer,
-    train_brain_talk, brain_generate, train_and_bench,
+    train_brain_talk, brain_generate, brain_diagnostic_decode, train_and_bench,
     bootstrap_concept_tokenizer, build_concept_tokenizer,
 };
 use gestalt::eval::score_plan_bench;
+use gestalt::executor::Executor;
 use gestalt::pipeline::{run_goal, PipelineConfig};
 use gestalt::planner::{PlanLmConfig, train_sft, greedy_decode};
+use gestalt::session::JarvisSession;
 use gestalt::tokenizer::{PlanTokenizer, ConceptTokenizer};
 use gestalt::memory::EpisodicMemory;
 use gestalt::training::{save_checkpoint, load_checkpoint};
 
-use candle_core::Device;
+use candle_core::{Device, IndexOp, Tensor};
 use candle_nn::VarMap;
 use std::io::{self, BufRead, Write};
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Config Tier Selection
@@ -156,8 +159,9 @@ fn main() {
             cmd_train(tier, resume)
         }
         "eval" => cmd_eval(tier),
-        "serve" => cmd_serve(tier),
+        "serve" | "chat" => cmd_serve(tier),
         "gallery" => cmd_gallery(tier),
+        "diagnose" => cmd_diagnose(tier),
         _ => {
             print_usage();
             std::process::exit(1);
@@ -177,8 +181,9 @@ fn print_usage() {
     eprintln!("  run <goal>   Execute a single goal");
     eprintln!("  train [--resume]  Train brain (SFT + DA + policy + planner)");
     eprintln!("  eval         Run plan_bench evaluation");
-    eprintln!("  serve        Persistent stdin/stdout interface");
+    eprintln!("  serve/chat   JARVIS interactive REPL (ReAct + memory + multi-turn)");
     eprintln!("  gallery      Run comprehensive generation gallery (requires checkpoint)");
+    eprintln!("  diagnose     Deep diagnostic: per-token probs, prefix discrimination, teacher-forced accuracy");
     eprintln!();
     eprintln!("Config tiers:");
     eprintln!("  test     d=64, 1-2 layers, CPU only (fast, for tests)");
@@ -188,7 +193,7 @@ fn print_usage() {
 
 /// Load ConceptTokenizer from file, or return byte-level (no merges) for test tier.
 fn load_or_build_decoder_tok(tier: ConfigTier) -> ConceptTokenizer {
-    let tok_path = "concept_tokenizer.bin";
+    let tok_path = "checkpoints/concept_tokenizer.bin";
     if tier == ConfigTier::Test {
         return ConceptTokenizer::new(); // byte-level for tests
     }
@@ -229,7 +234,7 @@ fn cmd_run(args: &[String], tier: ConfigTier) -> anyhow::Result<()> {
     let brain = Brain::new(config, &policy_cfg, &varmap, &device)?;
 
     // Load checkpoint if available
-    let ckpt = "brain_checkpoint.safetensors";
+    let ckpt = "checkpoints/brain_checkpoint.safetensors";
     if std::path::Path::new(ckpt).exists() {
         load_checkpoint(&varmap, ckpt, &device)?;
     } else {
@@ -269,6 +274,9 @@ fn cmd_train(tier: ConfigTier, resume: bool) -> anyhow::Result<()> {
     if let Ok(v) = std::env::var("GESTALT_ACCUM_STEPS") {
         if let Ok(a) = v.parse::<usize>() { config.grad_accum_steps = a; }
     }
+    if let Ok(v) = std::env::var("GESTALT_BATCH_SIZE") {
+        if let Ok(b) = v.parse::<usize>() { config.sft_batch_size = b; }
+    }
 
     eprintln!("[GESTALT] Config: {:?} | d_model={} | enc_layers={} | dec_layers={}",
         tier, config.d_model, config.encoder_layers, config.decoder_layers);
@@ -305,7 +313,7 @@ fn cmd_train(tier: ConfigTier, resume: bool) -> anyhow::Result<()> {
     let temperature = config.temperature;
     let (brain, _brain_varmap) = if resume {
         // Resume: load brain from best SFT checkpoint, skip training
-        let ckpt = "brain_best_sft.safetensors";
+        let ckpt = "checkpoints/brain_best_sft.safetensors";
         eprintln!("\n[GESTALT] === Resuming from {} ===", ckpt);
         anyhow::ensure!(std::path::Path::new(ckpt).exists(),
             "Cannot resume: {} not found", ckpt);
@@ -326,30 +334,32 @@ fn cmd_train(tier: ConfigTier, resume: bool) -> anyhow::Result<()> {
 
         // Save brain checkpoint
         if tier != ConfigTier::Test {
-            save_checkpoint(&brain_varmap, "brain_checkpoint.safetensors")?;
+            save_checkpoint(&brain_varmap, "checkpoints/brain_checkpoint.safetensors")?;
         }
         (brain, brain_varmap)
     };
 
-    // Grid search: brain-only mode skips planner/policy/gallery
-    if std::env::var("GESTALT_BRAIN_ONLY").is_ok() {
-        eprintln!("[GESTALT] BRAIN_ONLY mode — skipping planner/policy/gallery");
-        eprintln!("[GESTALT] Training complete (brain only).");
-        return Ok(());
-    }
-
-    // Save concept tokenizer (v17: always save after training for gallery/resume)
+    // Save concept tokenizer BEFORE any early exit (M-052: BRAIN_ONLY was skipping this)
     if tier != ConfigTier::Test {
-        let tok_path = std::path::Path::new("concept_tokenizer.bin");
+        let tok_path = std::path::Path::new("checkpoints/concept_tokenizer.bin");
         let tok_data = decoder_tok.save_merges();
         std::fs::write(tok_path, &tok_data)?;
         eprintln!("[GESTALT] Saved concept tokenizer to {:?} ({} bytes, {} vocab)",
             tok_path, tok_data.len(), decoder_tok.vocab_size());
 
         // Also re-bootstrap from trained encoder for comparison (optional diagnostic)
-        eprintln!("\n[GESTALT] === Bootstrapping concept tokenizer from encoder (T-014, diagnostic) ===");
-        let max_merges = if tier == ConfigTier::Phase2 { 8000 } else { 500 };
-        let _encoder_tok = bootstrap_concept_tokenizer(&brain, max_merges, 3, &device)?;
+        if !std::env::var("GESTALT_BRAIN_ONLY").is_ok() {
+            eprintln!("\n[GESTALT] === Bootstrapping concept tokenizer from encoder (T-014, diagnostic) ===");
+            let max_merges = if tier == ConfigTier::Phase2 { 8000 } else { 500 };
+            let _encoder_tok = bootstrap_concept_tokenizer(&brain, max_merges, 3, &device)?;
+        }
+    }
+
+    // Grid search: brain-only mode skips planner/policy/gallery
+    if std::env::var("GESTALT_BRAIN_ONLY").is_ok() {
+        eprintln!("[GESTALT] BRAIN_ONLY mode — skipping planner/policy/gallery");
+        eprintln!("[GESTALT] Training complete (brain only).");
+        return Ok(());
     }
 
     // Planner (SFT)
@@ -360,7 +370,7 @@ fn cmd_train(tier: ConfigTier, resume: bool) -> anyhow::Result<()> {
 
     // Save planner checkpoint
     if tier != ConfigTier::Test {
-        save_checkpoint(&plan_varmap, "planner_checkpoint.safetensors")?;
+        save_checkpoint(&plan_varmap, "checkpoints/planner_checkpoint.safetensors")?;
     }
 
     // Phase 3: Policy benchmark
@@ -488,7 +498,7 @@ fn cmd_gallery(tier: ConfigTier) -> anyhow::Result<()> {
     let varmap = VarMap::new();
     let brain = Brain::new(gallery_config, &policy_cfg, &varmap, &device)?;
 
-    let ckpt = "brain_checkpoint.safetensors";
+    let ckpt = "checkpoints/brain_checkpoint.safetensors";
     if std::path::Path::new(ckpt).exists() {
         load_checkpoint(&varmap, ckpt, &device)?;
         eprintln!("[GESTALT] Loaded checkpoint from {}", ckpt);
@@ -706,6 +716,297 @@ fn cmd_gallery(tier: ConfigTier) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Deep Diagnostic (Phase 1 instrumentation)
+// ---------------------------------------------------------------------------
+
+fn cmd_diagnose(tier: ConfigTier) -> anyhow::Result<()> {
+    let device = select_device(tier);
+    let config = tier.brain_config();
+    let policy_cfg = tier.policy_config();
+
+    let decoder_tok = load_or_build_decoder_tok(tier);
+    let mut diag_config = config.clone();
+    diag_config.decoder_vocab_size = decoder_tok.vocab_size();
+
+    let varmap = VarMap::new();
+    let brain = Brain::new(diag_config.clone(), &policy_cfg, &varmap, &device)?;
+
+    let ckpt = "checkpoints/brain_checkpoint.safetensors";
+    if std::path::Path::new(ckpt).exists() {
+        load_checkpoint(&varmap, ckpt, &device)?;
+        eprintln!("[DIAG] Loaded checkpoint from {}", ckpt);
+    } else {
+        anyhow::bail!("No checkpoint at {}. Run 'gestalt train' first.", ckpt);
+    }
+
+    let enc_tok = TalkTokenizer;
+    let enc_seq = diag_config.encoder_seq_len;
+    let dec_seq = diag_config.decoder_seq_len;
+
+    // ======================================================================
+    // TEST 1: Per-token probability trace (greedy, no rep_penalty)
+    // Shows exactly WHERE coherence breaks down and what the model considers
+    // ======================================================================
+    eprintln!("\n[DIAG] === TEST 1: Per-Token Probability Trace (greedy, raw) ===\n");
+
+    let diag_prompts = ["hello", "what is truth", "who are you", "explain attention"];
+    for prompt in &diag_prompts {
+        eprintln!("[DIAG] Prompt: \"{}\"", prompt);
+        let lines = brain_diagnostic_decode(&brain, prompt, 40, &decoder_tok, &device)?;
+        for line in &lines {
+            eprintln!("{}", line);
+        }
+        // Also show the actual generation with sampling for comparison
+        let gen = brain_generate(&brain, prompt, 60, 0.0, false, &decoder_tok, &device)?;
+        eprintln!("  => greedy output: \"{}\"\n", gen);
+    }
+
+    // ======================================================================
+    // TEST 2: Concept Prefix Discrimination
+    // If the decoder IGNORES the concept prefix, swapping concept vectors
+    // should produce identical output. If it USES the prefix, outputs differ.
+    // ======================================================================
+    eprintln!("[DIAG] === TEST 2: Concept Prefix Discrimination ===\n");
+
+    let pairs = [
+        ("hello", "explain quantum entanglement"),
+        ("who are you", "what is gradient descent"),
+        ("tell me a joke", "what is the meaning of life"),
+    ];
+
+    for (prompt_a, prompt_b) in &pairs {
+        // Encode both prompts to concept vectors
+        let ids_a = enc_tok.encode(prompt_a);
+        let padded_a = enc_tok.pad_or_truncate(&ids_a, enc_seq);
+        let tensor_a = Tensor::from_vec(padded_a, (1, enc_seq), &device)?;
+        let concept_a = brain.encode_concept(&tensor_a)?;
+
+        let ids_b = enc_tok.encode(prompt_b);
+        let padded_b = enc_tok.pad_or_truncate(&ids_b, enc_seq);
+        let tensor_b = Tensor::from_vec(padded_b, (1, enc_seq), &device)?;
+        let concept_b = brain.encode_concept(&tensor_b)?;
+
+        // Measure cosine similarity between concept vectors
+        let va = concept_a.squeeze(0)?.to_vec1::<f32>()?;
+        let vb = concept_b.squeeze(0)?.to_vec1::<f32>()?;
+        let dot: f32 = va.iter().zip(vb.iter()).map(|(a, b)| a * b).sum();
+        let norm_a: f32 = va.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let norm_b: f32 = vb.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let cosine = if norm_a > 0.0 && norm_b > 0.0 { dot / (norm_a * norm_b) } else { 0.0 };
+
+        // Generate with native concept vectors (greedy)
+        let gen_a = brain_generate(&brain, prompt_a, 30, 0.0, false, &decoder_tok, &device)?;
+        let gen_b = brain_generate(&brain, prompt_b, 30, 0.0, false, &decoder_tok, &device)?;
+
+        // Generate with SWAPPED concept vectors
+        // Use prompt_a's concept with BOS tokens to generate
+        let prefix_a = brain.build_prefix(&concept_a, None)?;
+        let prefix_b = brain.build_prefix(&concept_b, None)?;
+
+        let gen_a_with_b = generate_from_prefix(&brain, &prefix_b, 30, &decoder_tok, dec_seq, &device)?;
+        let gen_b_with_a = generate_from_prefix(&brain, &prefix_a, 30, &decoder_tok, dec_seq, &device)?;
+
+        eprintln!("[DIAG] A=\"{}\" vs B=\"{}\"  (concept cosine={:.4})", prompt_a, prompt_b, cosine);
+        eprintln!("  A native:     \"{}\"", gen_a);
+        eprintln!("  A w/ B's concept: \"{}\"", gen_a_with_b);
+        eprintln!("  B native:     \"{}\"", gen_b);
+        eprintln!("  B w/ A's concept: \"{}\"", gen_b_with_a);
+
+        // Check if swapped outputs differ from native
+        let a_changed = gen_a != gen_a_with_b;
+        let b_changed = gen_b != gen_b_with_a;
+        eprintln!("  => Prefix discriminates: A={}, B={}\n",
+            if a_changed { "YES" } else { "NO (decoder ignores prefix!)" },
+            if b_changed { "YES" } else { "NO (decoder ignores prefix!)" },
+        );
+    }
+
+    // ======================================================================
+    // TEST 3: Teacher-Forced Token Accuracy
+    // val_loss=1.58 but is the model actually predicting the right tokens?
+    // Measure top-1 and top-5 accuracy at each position.
+    // ======================================================================
+    eprintln!("[DIAG] === TEST 3: Teacher-Forced Token Accuracy ===\n");
+
+    // Load a few corpus pairs for teacher-forced analysis
+    let corpus_str = include_str!("../data/brain_corpus.json");
+    let corpus: Vec<serde_json::Value> = serde_json::from_str(corpus_str)?;
+
+    // Sample 20 pairs evenly from corpus
+    let sample_step = corpus.len() / 20;
+    let mut total_tokens = 0usize;
+    let mut top1_correct = 0usize;
+    let mut top5_correct = 0usize;
+    let mut pos_top1: Vec<(usize, usize)> = Vec::new(); // (correct, total) per position
+
+    for i in 0..20 {
+        let idx = i * sample_step;
+        let pair = &corpus[idx];
+        let prompt = pair["user"].as_str().unwrap_or("");
+        let response = pair["assistant"].as_str().unwrap_or("");
+
+        // Encode prompt → concept vector
+        let goal_ids = enc_tok.encode(prompt);
+        let goal_padded = enc_tok.pad_or_truncate(&goal_ids, enc_seq);
+        let goal_tensor = Tensor::from_vec(goal_padded, (1, enc_seq), &device)?;
+
+        // Encode response with BOS
+        let resp_ids = decoder_tok.encode(response);
+        let mut dec_input = vec![1u32]; // TOK_BOS
+        dec_input.extend_from_slice(&resp_ids);
+        // Targets are the response shifted by 1
+        let targets = &dec_input[1..]; // everything after BOS
+
+        // Pad decoder input to dec_seq
+        let mut padded_input = dec_input.clone();
+        padded_input.resize(dec_seq, 0); // TOK_PAD = 0
+
+        let input_tensor = Tensor::from_vec(padded_input, (1, dec_seq), &device)?;
+
+        // Forward pass (teacher-forced)
+        let logits = brain.forward(&goal_tensor, &input_tensor)?;
+
+        // Check predictions at each position
+        for (pos, &target_id) in targets.iter().enumerate() {
+            if pos >= dec_seq { break; }
+            let pos_logits = logits.i((0, pos))?.to_vec1::<f32>()?;
+
+            // Sort by logit value for top-k
+            let mut indexed: Vec<(usize, f32)> = pos_logits.iter()
+                .enumerate()
+                .map(|(i, &l)| (i, l))
+                .collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+            let predicted_id = indexed[0].0 as u32;
+            let in_top5 = indexed.iter().take(5).any(|(id, _)| *id as u32 == target_id);
+
+            if predicted_id == target_id { top1_correct += 1; }
+            if in_top5 { top5_correct += 1; }
+            total_tokens += 1;
+
+            // Track per-position accuracy (up to 30 positions)
+            if pos < 30 {
+                while pos_top1.len() <= pos {
+                    pos_top1.push((0, 0));
+                }
+                pos_top1[pos].1 += 1;
+                if predicted_id == target_id {
+                    pos_top1[pos].0 += 1;
+                }
+            }
+        }
+    }
+
+    eprintln!("[DIAG] Teacher-forced accuracy over {} tokens from 20 corpus samples:", total_tokens);
+    eprintln!("  Top-1: {}/{} ({:.1}%)", top1_correct, total_tokens, 100.0 * top1_correct as f64 / total_tokens as f64);
+    eprintln!("  Top-5: {}/{} ({:.1}%)", top5_correct, total_tokens, 100.0 * top5_correct as f64 / total_tokens as f64);
+
+    eprintln!("\n[DIAG] Per-position top-1 accuracy (teacher-forced):");
+    for (pos, (correct, total)) in pos_top1.iter().enumerate() {
+        if *total > 0 {
+            let pct = 100.0 * *correct as f64 / *total as f64;
+            let bar_len = (pct / 5.0) as usize;
+            let bar: String = std::iter::repeat('#').take(bar_len).collect();
+            eprintln!("  pos {:2}: {:3}/{:3} ({:5.1}%) {}", pos, correct, total, pct, bar);
+        }
+    }
+
+    // ======================================================================
+    // TEST 4: Entropy per Position (autoregressive)
+    // High entropy = model is uncertain. If entropy spikes at position N,
+    // that's where coherence breaks down.
+    // ======================================================================
+    eprintln!("\n[DIAG] === TEST 4: Per-Position Entropy (autoregressive, greedy) ===\n");
+
+    let entropy_prompts = ["hello", "what is truth", "tell me a joke"];
+    for prompt in &entropy_prompts {
+        let goal_ids = enc_tok.encode(prompt);
+        let goal_padded = enc_tok.pad_or_truncate(&goal_ids, enc_seq);
+        let goal_tensor = Tensor::from_vec(goal_padded, (1, enc_seq), &device)?;
+        let concept_vec = brain.encode_concept(&goal_tensor)?;
+        let prefix = brain.build_prefix(&concept_vec, None)?;
+
+        let mut generated: Vec<u32> = vec![1]; // BOS
+        let mut entropies = Vec::new();
+        let mut tokens = Vec::new();
+
+        for _ in 0..30 {
+            let mut padded = generated.clone();
+            padded.resize(dec_seq, 0);
+            let input = Tensor::from_vec(padded, (1, dec_seq), &device)?;
+            let logits = brain.language_decoder.forward_with_prefix(&prefix, &input)?;
+            let read_pos = generated.len() - 1;
+            let raw = logits.i((0, read_pos))?.to_vec1::<f32>()?;
+
+            // Compute softmax
+            let max_l = raw.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = raw.iter().map(|&l| (l - max_l).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            let probs: Vec<f32> = exps.iter().map(|e| e / sum).collect();
+
+            // Entropy = -sum(p * log(p))
+            let entropy: f32 = probs.iter()
+                .filter(|&&p| p > 1e-10)
+                .map(|&p| -p * p.ln())
+                .sum();
+
+            // Greedy token
+            let best_id = probs.iter().enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i as u32).unwrap_or(2); // EOS
+
+            entropies.push(entropy);
+            tokens.push(decoder_tok.decode(&[best_id]));
+
+            if best_id == 2 { break; } // EOS
+            generated.push(best_id);
+        }
+
+        eprintln!("[DIAG] \"{}\" entropy trace:", prompt);
+        for (i, (ent, tok)) in entropies.iter().zip(tokens.iter()).enumerate() {
+            let bar_len = (*ent * 3.0) as usize;
+            let bar: String = std::iter::repeat('|').take(bar_len.min(40)).collect();
+            eprintln!("  pos {:2}: H={:.3} tok={:10} {}", i, ent, tok, bar);
+        }
+        eprintln!();
+    }
+
+    eprintln!("[DIAG] === Diagnostic complete ===");
+    Ok(())
+}
+
+/// Generate from a pre-built prefix (for concept swap tests).
+fn generate_from_prefix(
+    brain: &Brain,
+    prefix: &Tensor,
+    max_tokens: usize,
+    decoder_tok: &ConceptTokenizer,
+    dec_seq: usize,
+    device: &Device,
+) -> anyhow::Result<String> {
+    let mut generated: Vec<u32> = vec![1]; // BOS
+
+    for _ in 0..max_tokens {
+        let mut padded = generated.clone();
+        padded.resize(dec_seq, 0);
+        let input = Tensor::from_vec(padded, (1, dec_seq), device)?;
+        let logits = brain.language_decoder.forward_with_prefix(prefix, &input)?;
+        let read_pos = generated.len() - 1;
+        let raw = logits.i((0, read_pos))?.to_vec1::<f32>()?;
+
+        let next_id = raw.iter().enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i as u32).unwrap_or(2);
+
+        if next_id == 2 { break; } // EOS
+        generated.push(next_id);
+    }
+
+    Ok(decoder_tok.decode(&generated[1..]))
+}
+
 fn cmd_eval(tier: ConfigTier) -> anyhow::Result<()> {
     let device = select_device(tier);
     let tok = PlanTokenizer::new();
@@ -737,14 +1038,15 @@ fn cmd_serve(tier: ConfigTier) -> anyhow::Result<()> {
     let mut brain = Brain::new(config.clone(), &policy_cfg, &varmap, &device)?;
 
     // Load checkpoint if available
-    let ckpt = "brain_checkpoint.safetensors";
+    let ckpt = "checkpoints/brain_checkpoint.safetensors";
     if std::path::Path::new(ckpt).exists() {
         load_checkpoint(&varmap, ckpt, &device)?;
+        eprintln!("[JARVIS] Brain loaded from {}", ckpt);
     } else {
-        eprintln!("[GESTALT] No checkpoint found, using untrained brain");
+        eprintln!("[JARVIS] No checkpoint found, using untrained brain");
     }
 
-    // T-021: Load episodic memories from SQLite for cross-session persistence.
+    // Load episodic memories from SQLite for cross-session persistence
     let mem_db_path = "episodic_memory.db";
     let episodic = EpisodicMemory::open(mem_db_path, config.d_model, config.memory_capacity)?;
     let stored = episodic.len()?;
@@ -754,43 +1056,99 @@ fn cmd_serve(tier: ConfigTier) -> anyhow::Result<()> {
             .map(|r| (r.concept_vec, r.response))
             .collect();
         brain.load_memories(&memories);
-        eprintln!("[GESTALT] Loaded {} episodic memories from {}", memories.len(), mem_db_path);
+        eprintln!("[JARVIS] Loaded {} episodic memories from {}", memories.len(), mem_db_path);
     }
 
-    let pipeline_config = PipelineConfig::default_config(std::env::current_dir()?);
+    // Setup executor and session
+    let work_dir = std::env::current_dir()?;
+    let executor = Executor::new(work_dir.clone(), false, Duration::from_secs(30));
+    let mut session = JarvisSession::new();
 
-    eprintln!("[GESTALT] Ready ({:?} config). Enter goals (one per line, 'quit' to exit):", tier);
+    eprintln!("[JARVIS] ═══════════════════════════════════════════════");
+    eprintln!("[JARVIS] GESTALT WIRED-V5 — Phase 3 ReAct Engine");
+    eprintln!("[JARVIS] Config: {:?} | d_model={} | memories={}", tier, config.d_model, stored);
+    eprintln!("[JARVIS] Tools: 15 built-in | ReAct: max 5 iterations");
+    eprintln!("[JARVIS] Type 'quit' to exit, '/memory' to show memories");
+    eprintln!("[JARVIS] ═══════════════════════════════════════════════");
+    eprintln!();
+
     let stdin = io::stdin();
+    print!("You: ");
+    io::stdout().flush()?;
+
     for line in stdin.lock().lines() {
-        let goal = line?;
-        let trimmed = goal.trim();
-        if trimmed.is_empty() || trimmed == "quit" {
+        let input = line?;
+        let trimmed = input.trim();
+
+        if trimmed.is_empty() {
+            print!("You: ");
+            io::stdout().flush()?;
+            continue;
+        }
+
+        if trimmed == "quit" || trimmed == "/quit" {
+            eprintln!("[JARVIS] Shutting down. Memories persisted to {}", mem_db_path);
             break;
         }
 
-        match run_goal(&brain, trimmed, &pipeline_config, &decoder_tok, &device) {
-            Ok(result) => {
-                // T-021: Store interaction in episodic memory for cross-session recall.
-                if !result.final_output.is_empty() {
-                    let enc_tok = TalkTokenizer;
-                    let goal_ids = enc_tok.encode(trimmed);
-                    let goal_padded = enc_tok.pad_or_truncate(&goal_ids, config.encoder_seq_len);
-                    if let Ok(goal_tensor) = candle_core::Tensor::from_vec(
-                        goal_padded, (1, config.encoder_seq_len), &device,
-                    ) {
-                        if let Ok(cv) = brain.encode_concept(&goal_tensor) {
-                            if let Ok(cv_vec) = cv.squeeze(0).and_then(|t| t.to_vec1::<f32>()) {
-                                let _ = episodic.store(&cv_vec, trimmed, &result.final_output, result.success);
-                                brain.store_memory(cv_vec, result.final_output.clone());
-                            }
+        if trimmed == "/memory" {
+            eprintln!("[JARVIS] In-memory: {} entries | SQLite: {} entries",
+                brain.memory_count(), episodic.len()?);
+            eprintln!("[JARVIS] Session turns: {}/{}", session.buffer.len(), session.buffer.capacity());
+            print!("\nYou: ");
+            io::stdout().flush()?;
+            continue;
+        }
+
+        if trimmed == "/history" {
+            let ctx = session.buffer.context_string(10, 4096);
+            if ctx.is_empty() {
+                eprintln!("[JARVIS] No conversation history yet.");
+            } else {
+                eprintln!("{}", ctx);
+            }
+            print!("\nYou: ");
+            io::stdout().flush()?;
+            continue;
+        }
+
+        if trimmed == "/clear" {
+            session.buffer.clear();
+            eprintln!("[JARVIS] Session cleared.");
+            print!("\nYou: ");
+            io::stdout().flush()?;
+            continue;
+        }
+
+        // Process through the full ReAct pipeline
+        match session.process_message(
+            trimmed, &brain, &executor, &decoder_tok, &device,
+        ) {
+            Ok(response) => {
+                println!("\nJARVIS: {}", response);
+
+                // Persist to episodic memory
+                let enc_tok = TalkTokenizer;
+                let goal_ids = enc_tok.encode(trimmed);
+                let goal_padded = enc_tok.pad_or_truncate(&goal_ids, config.encoder_seq_len);
+                if let Ok(goal_tensor) = Tensor::from_vec(
+                    goal_padded, (1, config.encoder_seq_len), &device,
+                ) {
+                    if let Ok(cv) = brain.encode_concept(&goal_tensor) {
+                        if let Ok(cv_vec) = cv.squeeze(0).and_then(|t| t.to_vec1::<f32>()) {
+                            let _ = episodic.store(&cv_vec, trimmed, &response, true);
+                            brain.store_memory(cv_vec, response.clone());
                         }
                     }
                 }
-                println!("{}", result.final_output);
-                io::stdout().flush()?;
             }
-            Err(e) => eprintln!("[ERROR] {}", e),
+            Err(e) => {
+                eprintln!("\n[ERROR] {}", e);
+            }
         }
+
+        print!("\nYou: ");
+        io::stdout().flush()?;
     }
     Ok(())
 }

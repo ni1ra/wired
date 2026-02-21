@@ -1,4 +1,4 @@
-// End-to-end integration tests — T-012 (Phase 1)
+// End-to-end integration tests — T-012 (Phase 1), T-023 (Phase 3 ReAct)
 //
 // Tests the full pipeline: goal → classify → plan → execute → result
 // Uses test-sized models (untrained) to verify structural correctness.
@@ -8,10 +8,12 @@ use gestalt::brain::{
     ACT_TALK, ACT_END, ACT_CARGO_CHECK, ACT_REPO_READ, ACT_MEMORY_SEARCH,
     NUM_INTENTS,
 };
+use gestalt::executor::Executor;
 use gestalt::memory::EpisodicMemory;
 use gestalt::pipeline::{
     run_goal, run_with_plan, classify_goal, action_name, PipelineConfig,
 };
+use gestalt::session::{JarvisSession, SessionBuffer, ReactLoop};
 use gestalt::tokenizer::ConceptTokenizer;
 use candle_core::Device;
 use candle_nn::VarMap;
@@ -258,4 +260,77 @@ fn test_episodic_memory_consolidation_across_sessions() {
     }
 
     let _ = std::fs::remove_file(db_path);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: ReAct loop + JarvisSession integration tests
+// ---------------------------------------------------------------------------
+
+fn test_executor() -> Executor {
+    Executor::new(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+        false,
+        Duration::from_secs(30),
+    )
+}
+
+#[test]
+fn test_react_loop_conversational() {
+    // ReAct loop should handle simple greetings without crashing
+    let (brain, dtok, device) = create_test_brain();
+    let executor = test_executor();
+    let mut session = SessionBuffer::default_session();
+    let react = ReactLoop::new(3);
+
+    let result = react.run(
+        &brain, "hello", &mut session, &executor, &dtok, &device,
+    ).unwrap();
+
+    assert!(!result.final_response.is_empty(), "Should produce a response");
+    assert!(!result.steps.is_empty(), "Should have at least one step");
+}
+
+#[test]
+fn test_jarvis_session_multi_turn() {
+    // JarvisSession should maintain conversation context across turns
+    let (brain, dtok, device) = create_test_brain();
+    let executor = test_executor();
+    let mut session = JarvisSession::new();
+
+    // Turn 1
+    let r1 = session.process_message(
+        "hello", &brain, &executor, &dtok, &device,
+    ).unwrap();
+    assert!(!r1.is_empty());
+    assert_eq!(session.buffer.len(), 2); // user + assistant
+
+    // Turn 2
+    let r2 = session.process_message(
+        "what can you do", &brain, &executor, &dtok, &device,
+    ).unwrap();
+    assert!(!r2.is_empty());
+    assert_eq!(session.buffer.len(), 4); // 2 user + 2 assistant
+
+    // Verify session context includes both turns
+    let ctx = session.buffer.context_string(10, 4096);
+    assert!(ctx.contains("hello"), "Context should include first turn");
+    assert!(ctx.contains("what can you do"), "Context should include second turn");
+}
+
+#[test]
+fn test_jarvis_session_buffer_eviction() {
+    // SessionBuffer should evict oldest turns when full
+    let (brain, dtok, device) = create_test_brain();
+    let executor = test_executor();
+    let mut session = JarvisSession::new();
+
+    // Fill beyond the 32-turn capacity (16 exchanges = 32 turns)
+    for i in 0..18 {
+        let _ = session.process_message(
+            &format!("message {}", i), &brain, &executor, &dtok, &device,
+        );
+    }
+
+    // Should be capped at capacity
+    assert!(session.buffer.len() <= session.buffer.capacity());
 }

@@ -1,2078 +1,2635 @@
-# GESTALT: Building an AI Brain From Scratch
+# GESTALT: Building an AI Brain From Scratch in Rust
 
-**A technical guide to WIRED-V5 — what it is, how it works, and why every decision was made.**
+**A complete technical guide to WIRED-V5 -- what it is, how every component works, and why every design decision was made.**
 
-*February 2026.*
+*February 2026*
 
 ---
 
 ## Table of Contents
 
-1. [What Is This?](#1-what-is-this)
-2. [Why Build Your Own AI?](#2-why-build-your-own-ai)
-3. [Why Rust? Why From Scratch?](#3-why-rust-why-from-scratch)
-4. [The Big Picture](#4-the-big-picture)
-5. [The Concept Bottleneck — The Core Idea](#5-the-concept-bottleneck)
-6. [The Transformer — The Building Block](#6-the-transformer)
-7. [The Brain — Where Everything Meets](#7-the-brain)
-8. [The Policy Heads — Making Decisions](#8-the-policy-heads)
-9. [The Planner — Plans That Can't Be Wrong](#9-the-planner)
-10. [The Executor — Running Real Tools](#10-the-executor)
-11. [The Language Decoder — How It Speaks](#11-the-language-decoder)
-12. [The Tokenizer Story — From Bytes to Words](#12-the-tokenizer-story)
-13. [The Corpus Pipeline — Feeding the Brain](#13-the-corpus-pipeline)
-14. [Memory — The Brain Remembers](#14-memory)
-15. [Training — Teaching the Brain](#15-training)
-16. [The Training Story — v2 to v23](#16-the-training-story)
-17. [The Full Pipeline — A Complete Walkthrough](#17-the-full-pipeline)
-18. [The Gallery — How We Measure Quality](#18-the-gallery)
-19. [Gradient Accumulation — Scaling Up](#19-gradient-accumulation)
-20. [Where It Stands Now](#20-where-it-stands-now)
-21. [The Road Ahead](#21-the-road-ahead)
-22. [GESTALT vs ChatGPT](#22-gestalt-vs-chatgpt)
-23. [Design Philosophy](#23-design-philosophy)
-24. [Glossary](#24-glossary)
+1. [Introduction -- What Is GESTALT?](#1-introduction----what-is-gestalt)
+2. [Why Build From Scratch? Why Rust?](#2-why-build-from-scratch-why-rust)
+3. [Architecture Overview](#3-architecture-overview)
+4. [The Transformer -- The Universal Building Block](#4-the-transformer----the-universal-building-block)
+5. [The Brain -- Where Everything Meets](#5-the-brain----where-everything-meets)
+6. [The Tokenizer -- From Bytes to Meaning](#6-the-tokenizer----from-bytes-to-meaning)
+7. [The Memory System -- Episodic Recall](#7-the-memory-system----episodic-recall)
+8. [The Planner -- FSM-Constrained Decoding](#8-the-planner----fsm-constrained-decoding)
+9. [The Policy Heads -- Making Decisions](#9-the-policy-heads----making-decisions)
+10. [Training -- Teaching the Brain](#10-training----teaching-the-brain)
+11. [What We Learned -- Findings From v18 Through v23](#11-what-we-learned----findings-from-v18-through-v23)
+12. [What Comes Next](#12-what-comes-next)
+13. [Glossary](#13-glossary)
 
 ---
 
-## 1. What Is This?
+## 1. Introduction -- What Is GESTALT?
 
-GESTALT is an AI brain built from scratch in Rust. Not a wrapper around OpenAI. Not a fine-tuned LLaMA. From scratch — every matrix multiplication, every attention head, every training loop, written by hand.
+GESTALT is an AI brain built entirely from scratch in Rust. Not a wrapper around
+an existing model. Not a fine-tuned LLaMA. Every matrix multiplication, every
+attention head, every gradient computation, every training loop -- written by hand
+using the candle-rs tensor library for GPU acceleration.
 
-If ChatGPT is a fully furnished apartment you rent, GESTALT is a house you're building from the foundation up. We poured the concrete, framed the walls, and wired the electricity ourselves. It's smaller than the apartment — but we own every nail and know where every pipe runs.
+The name comes from the German word *Gestalt*, meaning "a whole that is greater
+than the sum of its parts." This captures the core philosophy: a single unified
+neural network with specialized regions sharing a common understanding of the
+world, rather than separate models stitched together with glue code.
 
-The name "gestalt" means *a whole that is greater than the sum of its parts*. That's the core philosophy: one unified brain with specialized regions sharing a common understanding, rather than separate models duct-taped together.
+### What It Does
 
-### What It Does (When Finished)
-
-Give it a goal in plain English:
+Give GESTALT a goal in plain English:
 
 ```
 "search for the GPU policy code and then open it"
 ```
 
-And it will:
-1. **Understand** what you want (intent: search then read)
-2. **Plan** the steps (step 1: ripgrep search, step 2: read file)
-3. **Execute** those steps (actually run the tools on your machine)
-4. **Remember** what happened (store the experience for next time)
-5. **Respond** in natural language ("Found the GPU policy in src/policy.rs...")
+It will:
 
-All inside a single neural network. No GPT API call. No clever prompt.
+1. **Understand** your intent by encoding the text into a concept vector -- a
+   dense mathematical summary of what you mean.
+2. **Classify** the action type using policy heads (search + read = composite).
+3. **Plan** the steps using an FSM-constrained decoder that can only produce
+   syntactically valid tool sequences.
+4. **Execute** those steps in real subprocesses on your machine -- ripgrep,
+   file reads, tests, git operations.
+5. **Remember** the experience by storing the concept vector and outcome in
+   episodic memory backed by SQLite.
+6. **Respond** in natural language with a consistent JARVIS personality
+   trained into the weights.
 
-### The JARVIS Connection
+All of this happens inside one binary. No API calls. No cloud dependency.
 
-GESTALT's personality target is JARVIS from Iron Man — specifically the MCU version mixed with TARS from Interstellar. Dry wit, competent, helpful, never annoying. The language model is trained on curated JARVIS-style dialogue so it sounds like a British butler who also happens to be a world-class engineer.
+### The JARVIS Personality
 
-This isn't cosmetic — personality consistency is a real engineering problem. When you talk to ChatGPT, it has no persistent voice. Ask it the same question twice and you'll get two different tones, two different personalities. GESTALT trains personality *into the weights*. The JARVIS voice isn't a system prompt that can be jailbroken — it's the only language the model knows how to speak.
+GESTALT's language model is trained on curated dialogue pairs written in the
+voice of JARVIS (MCU) crossed with TARS (Interstellar). Dry wit, competence,
+helpful without being sycophantic. This is not a system prompt that can be
+jailbroken -- the personality is baked into the weights themselves. It is the
+only voice the model knows how to produce.
 
-The goal isn't to build a chatbot. It's to build a genuine AI assistant that lives on your machine, knows your codebase, remembers your preferences, and speaks with a consistent voice that gets better over time. An AI that earns the name JARVIS.
+### The Scale
 
-### The Scale of This Thing
+Let us be direct about the size differential. GPT-4 is estimated at roughly
+1.8 trillion parameters, trained on trillions of tokens across thousands of
+GPUs for months. GESTALT is approximately 50 million parameters at its current
+training scale, trained on 92,000 dialogue pairs on a single RTX 5070 Ti in
+under two hours.
 
-Let's be honest about what we're up against. GPT-4 is estimated at ~1.8 trillion parameters, trained on trillions of tokens across thousands of GPUs for months. GESTALT is ~50 million parameters, trained on 21,000 dialogue pairs on a single GPU in 90 minutes.
-
-That's not a fair fight, and we're not pretending it is.
-
-But here's the thing: GPT-4 forgets you the moment the conversation ends. GESTALT remembers. GPT-4 runs on someone else's server. GESTALT runs on your machine. GPT-4 can't explain why it made a decision. GESTALT lets you inspect every weight, every attention pattern, every gradient.
-
-The question isn't "can this beat ChatGPT?" It's "can this become something ChatGPT fundamentally can't be?"
-
----
-
-## 2. Why Build Your Own AI?
-
-### What's Wrong With Existing AI
-
-ChatGPT, Claude, and Copilot are phenomenally capable. But they have fundamental limits:
-
-**No persistent memory.** Every conversation starts from zero. Tell Claude your favorite color today, ask tomorrow — blank stare. There are workarounds (conversation history, RAG systems), but they're bolted on. The model itself doesn't remember.
-
-**No local tool execution.** They run code in remote sandboxes, not on YOUR machine. GESTALT runs tools in real subprocesses with access to your actual files, your actual test suite, your actual git repo.
-
-**No learning from experience.** Use ChatGPT for 1,000 tasks and it hasn't improved at all on task 1,001. The weights are frozen. GESTALT's architecture is designed to get better with every interaction through online micro-training.
-
-**Massive and opaque.** GPT-4 is estimated at ~1.8 trillion parameters. You can't inspect it, modify it, or understand why it made a decision. If it gives you a wrong answer, you can't look at the attention patterns and say "ah, it focused on the wrong part of my question." GESTALT targets ~200M parameters — small enough to understand end-to-end.
-
-**No ownership.** Your conversations with ChatGPT are on OpenAI's servers. Your prompts, your code, your company's proprietary information — all flowing through someone else's infrastructure. GESTALT is yours. The model file sits on your disk. The weights are in your VRAM. Nothing leaves your machine unless you explicitly send it.
-
-### What This Project Actually Teaches
-
-Building a neural network from scratch is the best way to understand how AI actually works. Not "a transformer uses attention" — actually understand it. Why does attention need Q, K, and V? What happens when you forget positional encoding? Why does the learning rate need a warmup period?
-
-Every conceptual question has a concrete answer in this codebase:
-
-- "How does a transformer work?" → Read `transformer.rs` (650 lines)
-- "How does training work?" → Read `training.rs` (550 lines)
-- "How does tokenization work?" → Read `tokenizer.rs` (1,100 lines)
-- "What's a concept vector?" → Look at `brain.rs:encode()` (one function call)
-
-No abstraction layers. No framework magic. Just math.
-
-### The V4 Story
-
-GESTALT is V5 of the WIRED project. V4 worked — it could classify intents, generate plans, and execute tools. But it had three architectural problems that V5 fixes:
-
-**Brain split.** V4 had a separate "policy brain" (decides what to do) and "language brain" (generates text). They didn't share any understanding. Like having one person who can think but can't speak, and another who can speak but can't think. V5 merges them into one brain.
-
-**Memory bolted on.** V4's decoder was trained without memory, then memory was added later. The decoder never learned to *use* memories. Like learning to cook for 10 years and then someone gives you a recipe book — you've already developed all your habits without it. When we turned memory on in V4, the decoder actively ignored the memory tokens. They were noise to it. V5 trains with memory from day one.
-
-**Tokenizer ceiling.** V4 used a 373-token vocabulary — enough for structured plans, nowhere near enough for natural language. English has ~170,000 words in common use. Even with byte-level generation (256 tokens for raw bytes), producing coherent text requires the model to learn spelling, grammar, and meaning simultaneously. V5 scales to a concept-space tokenizer with learned merges.
+This is not a competition. GESTALT does things that trillion-parameter cloud
+models fundamentally cannot: it runs on your machine, remembers you across
+sessions, executes real tools in your environment, and lets you inspect every
+weight and gradient. The question is not "can this beat ChatGPT?" but rather
+"can this become something ChatGPT can never be?"
 
 ---
 
-## 3. Why Rust? Why From Scratch?
+## 2. Why Build From Scratch? Why Rust?
 
-### The Language Choice
+### The Case for From-Scratch
 
-Most AI research happens in Python. PyTorch, TensorFlow, JAX — the entire ecosystem is Python-first. So why Rust?
+Most AI projects start by downloading a pre-trained model (LLaMA, Mistral,
+Phi) and fine-tuning it. This gets you impressive results quickly, but you
+inherit an architecture you do not fully control and cannot deeply modify.
+Want to add episodic memory as a first-class concept? Want a concept
+bottleneck that forces the model to compress meaning before generating
+text? Want an FSM-constrained decoder that physically cannot produce
+invalid tool plans? These architectural innovations require building from
+the foundation.
 
-**Memory safety at compile time.** Neural network training involves massive tensor operations, GPU memory management, and complex data pipelines. In Python, a subtle memory leak means your training crashes at hour 47 of an 80-hour run. In Rust, the borrow checker catches these at compile time. If it compiles, the memory management is correct.
+The educational value is immense: when something fails, you know exactly
+where to look. When candle-rs's built-in RmsNorm breaks gradient flow (and
+it did -- more on that later), you can replace it with three lines of basic
+tensor operations because you understand what RmsNorm actually computes.
 
-**No GIL.** Python's Global Interpreter Lock means true parallelism requires multiprocessing (slow, heavy, error-prone). Rust gives you real threads, real async, real parallelism. This matters when you're orchestrating GPU training, tool execution, memory retrieval, and HTTP serving simultaneously.
+### Why Rust
 
-**Performance.** The tokenizer bootstrap went from 83 minutes in a naive implementation to 2 seconds after optimization. Not because of algorithmic improvements — because Rust lets you write cache-friendly, zero-allocation code without fighting the language.
+Most deep learning happens in Python via PyTorch or JAX. Rust is an unusual
+choice, and there are concrete reasons for it:
 
-**Deployment simplicity.** GESTALT compiles to a single binary. `./gestalt serve` and you have an AI running locally. No `pip install`, no dependency hell, no "works on my machine." One binary, every dependency statically linked.
+**Performance without a runtime.** Rust compiles to native code with no
+garbage collector. The training binary uses ~98MB of RAM for a 50M parameter
+model -- the rest is GPU VRAM. Python+PyTorch would use several gigabytes of
+system RAM for the interpreter, framework overhead, and CUDA bindings before
+a single tensor is allocated.
 
-### The Framework: candle
+**candle-rs.** This is Hugging Face's Rust tensor library. It provides the
+GPU compute (CUDA matrix multiplications, element-wise operations) without
+PyTorch's massive dependency tree. A clean `cargo build --release --features
+cuda` produces a single binary with everything statically linked.
 
-We use **candle** (by Hugging Face) as the tensor computation library. It's Rust-native, supports CUDA, and gives us autograd (automatic differentiation) without the overhead of PyTorch.
+**Memory safety as architecture.** Rust's ownership system prevents entire
+classes of bugs that plague long-running AI systems: double-free, use-after-
+free, data races in concurrent generation. The type system catches mistakes
+at compile time rather than during a 2-hour training run.
 
-candle is young. This has pros and cons.
+**Single binary deployment.** `gestalt train --config default` runs the
+complete training pipeline. `gestalt serve --config default` launches the
+interactive server. No pip install, no conda environments, no version
+conflicts between numpy and scipy. One binary.
 
-**Pros:**
-- Lean. No 2GB framework download. No Python interop layer.
-- Direct CUDA control. Custom kernels in PTX assembly when needed.
-- Deterministic. Same input → same output. No hidden state from previous runs.
+### The candle-rs Constraint: f32 Only
 
-**Cons:**
-- Bugs. `candle_nn::RmsNorm` has a broken backward pass. So does `softmax_last_dim`. These two bugs cost us 12 training runs and 40+ hours before we found them (see [The Bug Graveyard](#17-the-bug-graveyard)).
-- Limited ecosystem. No pre-built data loaders, no distributed training, no mixed precision (yet).
-- f32 only for training. No fp16, no bf16, no int8 quantization. This means models that would fit in 4GB on PyTorch take 16GB on candle.
+candle-rs v0.8.4 does not support fp16 training. All tensors are 32-bit
+floats. This means GESTALT uses twice the VRAM that a PyTorch fp16 model
+would need for the same parameter count. On the RTX 5070 Ti's 16GB VRAM,
+this limits the practical model size to roughly 200M parameters (800MB of
+weights + 2.4GB of optimizer states + activations + KV cache).
 
-### Why Not Just Use PyTorch?
+This constraint shaped every dimension choice: d_model=512 for Phase 1
+(~50M params, fits comfortably), d_model=1024 for Phase 2 (~200M params,
+tight but viable with gradient accumulation).
 
-Because then we'd understand PyTorch, not neural networks.
+### The candle-rs Constraint: Broken Built-in Operations
 
-When you call `torch.nn.TransformerDecoder()`, you get a working decoder. But do you know what happens inside it? Do you know why it needs a causal mask? What happens if you remove RMSNorm from one layer? Why the feed-forward dimension is 4× the model dimension?
+Two candle-nn v0.8.4 built-in operations have silently broken backward
+passes:
 
-Building from scratch means every design decision is conscious. We chose d_ff = 4 × d_model because we read the "Attention Is All You Need" paper and implemented the recommendation. We use GELU instead of ReLU because we tested both and measured the difference. We use 8 attention heads because our experiments showed diminishing returns beyond 8 for our model size.
+1. **`candle_nn::RmsNorm`** -- breaks the autograd computation graph.
+   Every tensor passing through it becomes disconnected from gradient
+   tracking. Since transformers use RmsNorm twice per layer (before
+   attention and before the MLP), this means zero gradients flow to
+   any parameter through the transformer layers.
 
-You can read the paper. Or you can write the code and discover — viscerally — why each choice exists.
+2. **`candle_nn::ops::softmax_last_dim`** -- same issue. Breaks the
+   gradient chain in attention, preventing the query and key projections
+   from receiving gradients.
 
----
+These are not edge cases -- they silently prevent ANY transformer from
+learning anything except the final output projection. The model compiles,
+runs, produces outputs, and even reports decreasing loss (because the last
+linear layer can still learn), but 95% of the parameters never update.
 
-## 4. The Big Picture
+Twelve training runs failed before this was diagnosed. The fix was
+straightforward: replace both operations with manual implementations
+using only basic tensor ops (sqr, mean, sqrt, exp, div) that have
+working autograd. These custom implementations -- `GradRmsNorm` and
+`grad_softmax_last_dim` -- are now the backbone of every transformer
+in GESTALT.
 
-Here's the full architecture. Every component is explained in its own section below.
-
-```
-         goal_text (plain English)
-             |
-      [ConceptTokenizer]    converts text to token IDs
-             |
-         token_ids
-             |
-      [ConceptEncoder]      transformer layers → mean pool
-             |
-         concept_vec         THE BOTTLENECK — 512 numbers that ARE the meaning
-             |
-      [ConceptProjector]    expands to 16 prefix tokens
-             |
-         prefix: 16 tokens
-             |
-    +--------+--------+--------+--------+
-    |        |        |        |        |
- [Policy] [Planner] [Memory] [Language] [Session]
-  heads     FSM      store    decoder    ring buf
-    |        |        |        |
-  intent   plan    retrieve  response
- +actions  tokens   top-K    text
-    |        |        |        |
-    +--------+--------+--------+
-             |
-      [Executor]     runs real tools in subprocesses
-             |
-      [Pipeline]     orchestrates the whole flow
-             |
-         Result { steps, response, success }
-```
-
-### The Restaurant Analogy
-
-Think of GESTALT as a restaurant:
-
-- **The ConceptEncoder** is the waiter who listens to your order and writes it down on a single notecard (the concept vector). No matter how long your order is — "I'll have the carbonara, but could you use pancetta instead of guanciale, and can I get a side salad with balsamic but not too much, and actually can you make the pasta al dente" — the waiter distills it to one notecard.
-
-- **The PolicyHeads** are the head chef reading the notecard and deciding: "This is a pasta order — we need the pasta station and the sauce station." Five decisions in parallel, from the same notecard.
-
-- **The Planner** is the sous chef writing the exact recipe: "Step 1: boil water. Step 2: add pasta. Step 3: make sauce." And here's the key — the sous chef can ONLY write valid recipes. They physically can't write "Step 1: boil water. Step 2: Step 3: boil." The grammar rules are baked into their pen.
-
-- **The Executor** is the line cook actually doing the work — turning on the stove, boiling the water. Real flames, real pots, real food. Not a simulation.
-
-- **The LanguageDecoder** is the waiter again, translating the kitchen's work back into "Here's your carbonara, made with pancetta as you requested."
-
-- **Memory** is the restaurant's notebook: "Table 4 is allergic to shellfish. Table 7 always orders extra bread. The Tuesday regular likes their steak rare." Consulted every time that customer returns, even months later.
-
-Every region reads from the same notecard. That shared understanding is what makes it a *gestalt*, not a Rube Goldberg machine.
-
-### Data Flow in Numbers
-
-Here's what actually flows through the pipeline when you type "search for the GPU policy code":
-
-```
-Input:    "search for the GPU policy code"               (31 characters)
-          ↓ ConceptTokenizer
-Tokens:   [115, 101, 97, 114, ...]                       (12 concept tokens)
-          ↓ ConceptEncoder (1 encoder layer, 8 heads)
-Hidden:   (1, 12, 512) float32                           (24,576 numbers)
-          ↓ mean pool across non-PAD positions
-Concept:  (1, 512) float32                               (512 numbers — THE bottleneck)
-          ↓ ConceptProjector
-Prefix:   (1, 16, 512) float32                           (8,192 numbers — 16 "concept tokens")
-          ↓ PolicyHeads (5 linear layers, parallel)
-Intent:   RepoSearch (confidence: 0.94)                  (16-way classification)
-Actions:  [rg, END, PAD, PAD, PAD, PAD]                  (6 tool slots)
-          ↓ Planner (FSM-constrained decoder)
-Plan:     [STEP, RG, PAT1, EOP]                          (4 plan tokens)
-          ↓ Executor (real subprocess)
-Output:   "src/policy.rs:42: fn gpu_policy() {"           (ripgrep stdout)
-          ↓ LanguageDecoder (4 decoder layers)
-Response: "Found the GPU policy in src/policy.rs..."     (generated text)
-```
-
-Total computation: ~6ms on GPU. The bottleneck is the tool execution (subprocess spawn + I/O), not the neural network.
+The lesson: when using any framework, verify gradient flow through every
+layer before training. Do not trust built-in operations blindly.
 
 ---
 
-## 5. The Concept Bottleneck
+## 3. Architecture Overview
 
-This is the single most important idea in the architecture.
+GESTALT follows a **concept-bottleneck architecture**: all information from
+the input must pass through a compressed "concept vector" before reaching
+the output. This bottleneck forces the model to form abstract
+representations of meaning, rather than routing raw tokens through to
+the output.
 
-### What It Is
-
-When you type "search for the GPU policy code," the ConceptEncoder reads every byte, passes it through transformer layers, and **mean-pools** across all non-padding positions to produce a single vector of 512 floating-point numbers.
-
-```
-"search for the GPU policy code"
-    ↓
-[115, 101, 97, 114, 99, 104, ...]    ← raw bytes (or concept tokens)
-    ↓ ConceptEncoder (transformer)
-    ↓ mean pool non-PAD positions
-[0.23, -1.07, 0.84, ..., -0.31]      ← concept_vec (512 numbers)
-```
-
-That 512-dimensional vector **IS** the meaning. Not a summary. Not a hash. A learned compression where similar meanings map to nearby points in vector space.
-
-### Why Force a Bottleneck?
-
-Imagine explaining a coding task to a colleague. You could read them the entire 2,000-line file. Or you could say "the GPU policy enforcer in the policy module." Both convey the same *intent*, but the second one strips away everything except what matters.
-
-The bottleneck forces the encoder to learn that compression. It has 30+ bytes of input but only 512 numbers of output. It must learn which parts of "search for the GPU policy code" matter (intent: search, target: GPU policy) and which are noise (the words "for" and "the").
-
-This is different from how GPT works. GPT keeps the FULL sequence of tokens flowing through the model — every word remains as a separate vector throughout all layers. GESTALT compresses everything into 512 numbers, and then everything downstream works from that compression.
-
-Why? Because a concept vector can be:
-- **Stored** as a memory key (2,048 bytes on disk)
-- **Compared** to other concepts via cosine similarity (one dot product)
-- **Retrieved** from a memory bank (K comparisons)
-- **Projected** into different formats (prefix for decoder, key for memory, input for policy)
-
-One representation, many uses. That's the gestalt principle.
-
-### How It Expands
-
-512 numbers are great for decisions (the policy heads) but not enough for writing a paragraph. So the ConceptProjector expands:
+### The Full Pipeline
 
 ```
-concept_vec: (1, 512)     ← compressed meaning
-    ↓ linear layer + reshape
-prefix: (1, 16, 512)      ← 16 "concept tokens" for the decoder
+                        goal_text (UTF-8 bytes)
+                              |
+                      +-------v--------+
+                      | TalkTokenizer  |  byte-level: "hello" -> [BOS, 104, 101, 108, 108, 111, EOS]
+                      +-------+--------+
+                              |
+                         token_ids: (batch, seq_len)
+                              |
+                      +-------v--------+
+                      | ConceptEncoder |  1-layer transformer + mean pooling
+                      | (transformer)  |  goal_ids -> hidden states -> concept_vec
+                      +-------+--------+
+                              |
+                       concept_vec: (batch, d_model)    <-- THE BOTTLENECK
+                              |
+         +--------------------+--------------------+
+         |                    |                    |
+  +------v------+    +-------v--------+    +------v------+
+  |  Concept    |    |  Policy Heads  |    |   Memory    |
+  |  Projector  |    | (5 classifiers)|    |   Retrieval |
+  +------+------+    +-------+--------+    +------+------+
+         |                    |                    |
+   prefix: (B,16,d)    intent + actions      mem_vecs: (B,K,d)
+         |                    |                    |
+         |                    |              +-----v-----+
+         |                    |              |  Memory   |
+         |                    |              | Projector |
+         |                    |              +-----+-----+
+         |                    |                    |
+         |                    |              projected_mem: (B,K,d)
+         |                    |                    |
+   +-----v-----------+       |     CROSS-ATTENTION|
+   | Language Decoder |       |         +----------+
+   | (4-layer xformer)|<-----+         |
+   |                  |                 |
+   | self-attn: prefix+text             |
+   | cross-attn: Q from hidden <--------+ K/V from memory
+   |                  |
+   +--------+---------+
+            |
+      response text
 ```
 
-One vector becomes 16 tokens. The decoder reads these tokens as a prefix — they set the context for what it's about to say.
+The key architectural distinction: **concept prefix** enters the decoder through
+self-attention (prepended to the text token sequence), while **memory** enters
+through dedicated cross-attention layers (Q from the decoder's hidden states,
+K/V from projected memory vectors). This separation keeps the self-attention
+sequence short and focused while giving memory its own dedicated attention
+pathway.
 
-Think of the concept_vec as a sticky note that says "search + GPU policy." The prefix is an expanded brief that says "The user wants to search the codebase for GPU-related policy code, probably a Rust file, and they want to see the contents." Same information, more surface area for the decoder to attend to.
+### Data Flow: Tensor Shapes
 
-### Why Mean Pooling?
-
-This is one of our best debugging stories (see [The Training Story](#16-the-training-story) for the full version).
-
-An earlier version (v2-v13) used **last-token extraction** — taking the hidden state at the final sequence position. This failed catastrophically because our sequences were left-padded, meaning every input ends with the same padding/EOS pattern. Different inputs produced nearly identical concept vectors:
-
-```
-cosine_similarity("hello", "what is the meaning of life") = 0.9591
-```
-
-That's essentially identical. The encoder was "seeing" the padding tokens, not the content. Mean pooling over non-PAD positions gives every content token's representation equal weight:
+Here is the exact shape of every tensor as it flows through the system.
+All shapes are at fp32. Default config: d_model=512, 8 attention heads.
 
 ```
-After mean pooling:
-cosine_similarity("hello", "what is the meaning of life") = 0.25
+Input:
+  goal_text: &str                           "hello"
+  token_ids: (1, 128)                       byte-level, left-padded
+
+ConceptEncoder:
+  tok_emb:      (1, 128, 512)              token -> embedding vector
+  + RoPE:       applied per attention head  positional information injected
+  transformer:  (1, 128, 512)              1-layer, full causal attention
+  mean_pool:    (1, 512)                   average over non-PAD positions
+
+ConceptProjector:
+  linear:       (1, 8192)                  512 -> 16 * 512
+  reshape:      (1, 16, 512)              16 prefix embedding vectors
+
+MemoryRetrieval:
+  query:        (512,)                     concept_vec as flat query
+  top-K cosine: K=8 nearest neighbors     from stored concept vectors
+  mem_proj:     (1, 8, 512)               projected memory (for cross-attention)
+
+LanguageDecoder:
+  prefix:       (1, 16, 512)              concept prefix only (no memory in prefix)
+  BOS + text:   (1, 256, 512)             autoregressive token embeddings
+  self-attn:    (1, 272, 512)             prefix + text concatenated
+  cross-attn:   Q=(1, 272, 512)           from decoder hidden states
+                K/V=(1, 8, 512)           from projected memory
+  logits:       (1, 256, 459)             one probability distribution per position
+  output:       "Hello! How can I..."     sampled token by token
+
+PolicyHeads:
+  intent:       (1, 16)                   16-class intent classification
+  actions:      (1, 6, 16)               6 action slots, 15 tools + END
+  patterns:     (1, 6, 6)                per-slot pattern index
+  files:        (1, 6, 10)               per-slot file index
+  picks:        (1, 6, 129)              per-slot argument index
 ```
 
-That's discriminative — the vectors are genuinely different for different meanings.
+### Why a Concept Bottleneck?
 
-### Concept Space Visualization
+The concept bottleneck is the single most important architectural decision
+in GESTALT. Traditional language models pass information from input to
+output through high-dimensional hidden states at every layer. GESTALT
+instead forces all information through a single 512-dimensional vector.
 
-If you could visualize the 512-dimensional concept space (you can't, but humor me), you'd see clusters:
+This has three key benefits:
 
-```
-                    [technical questions]
-                       ↗  ↗  ↗
-    [greetings] ← ← ← center → → → [emotional support]
-       ↙  ↙                             ↘  ↘
-  [tool commands]                   [philosophical queries]
-```
+1. **Interpretable representations.** The concept vector is a point in a
+   space where similar meanings are nearby. You can measure the cosine
+   similarity between concept vectors for "hello" and "hey there" and
+   verify that they are closer to each other than to "run the tests."
+   This is not possible with the hidden states of a standard language
+   model, which are entangled across all positions.
 
-"hello" and "good morning" are close together. "search for X" and "find the file" are close together. "what is beauty?" and "what is the meaning of life?" are in the same neighborhood.
+2. **Memory becomes natural.** Since every interaction is summarized as a
+   single vector, storing and retrieving memories is just cosine similarity
+   search in a vector database. No RAG pipeline, no embedding model -- the
+   brain's own encoder produces the vectors.
 
-The model didn't learn these clusters from labels. It learned them from the training signal: inputs that should produce similar outputs need similar concept vectors. The structure emerges from the training objective.
+3. **Multiple downstream tasks share one representation.** The same concept
+   vector feeds the language decoder (for generating responses), the policy
+   heads (for choosing actions), and the planner (for structured tool plans).
+   One encoding step, multiple consumers.
+
+The cost is information loss. A 512-dimensional vector cannot capture every
+nuance of a 128-token input. This is a deliberate trade-off: we accept some
+loss of detail in exchange for a clean, structured representation that the
+rest of the system can reason about.
 
 ---
 
-## 6. The Transformer
+## 4. The Transformer -- The Universal Building Block
 
-Every neural computation in GESTALT uses the same building block: a **causal transformer**. If you've heard of GPT, it's the same architecture, implemented from scratch in Rust using the candle library.
+GESTALT uses the transformer architecture as its building block. Every
+neural component in the system -- the encoder, the decoder, the planner,
+the policy backbone -- is a transformer. Understanding this component is
+essential to understanding everything else.
 
-### What It Does
+### What a Transformer Does
 
-A transformer takes a sequence of token embeddings and makes each one aware of context:
+A transformer takes a sequence of vectors and produces a new sequence of
+vectors where each output has been informed by all the others. If you feed
+it the embeddings for "the cat sat on the mat," the output for "sat" will
+contain information about who did the sitting (the cat) and where (on the
+mat). This is called "attention" -- each position attends to all other
+positions to gather context.
 
-```
-Input:  [tok_1, tok_2, tok_3, tok_4]     ← 4 embeddings, each 512-dim
-         ↓ Layer 0
-        [out_1, out_2, out_3, out_4]      ← updated: context-aware
-         ↓ Layer 1 ... Layer 3
-Output: [out_1, out_2, out_3, out_4]      ← final representations
-```
+The key insight of transformers versus earlier architectures (RNNs, LSTMs)
+is that attention is computed in parallel across all positions, rather than
+sequentially left-to-right. This makes transformers dramatically faster to
+train on GPUs, which excel at parallel computation.
 
-Each layer has two sub-components:
-1. **Multi-Head Attention** — each position looks at other positions and decides what to focus on
-2. **Feed-Forward Network (MLP)** — processes each position independently, adding non-linear transformations
+### Architecture of a Single Transformer Block
 
-And critically: **residual connections**. The output of each sub-component is *added* to the input, not replaced. This means information can flow through the entire network unmodified if the layers decide not to change it. It's like a highway with optional exits — the information CAN take the exit and get transformed, but it doesn't have to.
-
-### Attention in Plain English
-
-For each position, the transformer computes three things from the same input:
-- **Query (Q)**: "What am I looking for?"
-- **Key (K)**: "What do I have to offer?"
-- **Value (V)**: "What information do I carry?"
-
-The attention score between positions is how well a Query matches a Key. High match → more attention → more influence on the output.
-
-Here's a concrete example. Consider the sentence "The cat sat on the mat":
+Each transformer block has three sub-modules: self-attention, optional
+cross-attention, and a feed-forward network (MLP). All use residual
+connections and normalization.
 
 ```
-Position 3 ("on") computes:
-  Q: "I'm a preposition, I need to know WHAT is being sat on"
-
-  Checks against every other position:
-    K[0] ("The"):  low match — articles don't answer "what?"
-    K[1] ("cat"):  medium match — possible object
-    K[2] ("sat"):  low match — verb, not an object
-    K[4] ("the"):  low match — article
-    K[5] ("mat"):  HIGH match — this is the object I'm looking for!
-
-  Result: position 3 attends mostly to position 5
-  Its representation becomes: "on" + context_from("mat") → "on [something]"
+        input: (batch, seq, d_model)          external memory (optional)
+          |                                         |
+   +------v------+                                  |
+   |   RmsNorm   |  normalize to unit variance      |
+   +------+------+                                  |
+          |                                         |
+   +------v------+                                  |
+   |  Self-Attn  |  each position gathers info      |
+   +------+------+  from all other positions         |
+          |                                         |
+   +------v------+                                  |
+   |   + input   |  residual connection              |
+   +------+------+                                  |
+          |                                         |
+   +------v------+                                  |
+   |   Dropout   |  randomly zero elements (p=0.1)  |
+   +------+------+                                  |
+          |                                         |
+          +--[if cross-attn enabled]---+            |
+          |                            |            |
+          |               +------------v--------+   |
+          |               |   RmsNorm           |   |
+          |               +------------+--------+   |
+          |                            |            |
+          |               +------------v--------+   |
+          |               | Cross-Attention     |<--+
+          |               | Q: from hidden      |  K/V: from memory
+          |               +------------+--------+
+          |                            |
+          |               +------------v--------+
+          |               |   + prev residual   |
+          |               +------------+--------+
+          |                            |
+          |               +------------v--------+
+          |               |   Dropout           |
+          |               +------------+--------+
+          |                            |
+          +----------------------------+
+          |
+   +------v------+
+   |   RmsNorm   |  normalize again
+   +------+------+
+          |
+   +------v------+
+   |     MLP     |  per-position nonlinear transformation
+   +------+------+
+          |
+   +------v------+
+   |   + prev    |  residual connection again
+   +------+------+
+          |
+   +------v------+
+   |   Dropout   |  random zeroing again
+   +------+------+
+          |
+        output: (batch, seq, d_model)
 ```
 
-This is simplified — the actual computation is learned, not programmed. But the mechanism is real: each position dynamically selects which other positions to attend to.
+The input and output have the same shape. This means transformer blocks are
+stackable: you can chain 1, 4, 8, or 100 of them, each refining the
+representation further. GESTALT uses 1 layer for the encoder and 4 layers
+for the decoder at Phase 1 scale.
 
-### Multi-Head: Parallel Perspectives
+The cross-attention sub-module is optional. It is enabled on the language
+decoder (which needs to attend to external memory) and disabled on the
+concept encoder and policy backbone (which have no external memory input).
+When disabled, the block is identical to a standard transformer block.
+When enabled, each layer gets its own cross-attention parameters, allowing
+different layers to attend to different aspects of the memory.
 
-GESTALT uses **8 attention heads** in parallel. Each head can focus on something different:
+### RmsNorm: Gradient-Safe Normalization
 
-```
-Head 0: tracks grammatical relationships ("on" → "mat")
-Head 1: tracks subject-verb agreement ("cat" → "sat")
-Head 2: tracks entity references ("The" → "cat")
-Head 3: tracks semantic similarity (tool names, intent keywords)
-Head 4-7: other learned patterns we can't easily name
-```
+Before attention and the MLP, the input is normalized using Root Mean Square
+Layer Normalization (RmsNorm). This stabilizes training by ensuring that
+vectors do not grow unboundedly large or shrink to near-zero as they pass
+through many layers.
 
-Each head has its own Q, K, V projections. Their outputs are concatenated and projected back to the model dimension. It's like having 8 translators who each focus on a different aspect of the text, then combine their notes.
-
-### Position: RoPE
-
-Transformers don't inherently know where tokens are. "The cat sat" and "sat cat the" look the same without position info. RoPE (Rotary Position Embedding) solves this by rotating the Q and K vectors based on position.
-
-The math is elegant: for each pair of dimensions, apply a rotation proportional to the position:
-
-```
-Q_rotated[2i]   = Q[2i] * cos(pos * θᵢ) - Q[2i+1] * sin(pos * θᵢ)
-Q_rotated[2i+1] = Q[2i] * sin(pos * θᵢ) + Q[2i+1] * cos(pos * θᵢ)
-```
-
-Where θᵢ = 1/10000^(2i/d). Lower dimensions rotate faster (capture local position), higher dimensions rotate slower (capture global position).
-
-The result: when computing attention between position 3 and position 5, the rotations naturally encode that they're 2 positions apart. Nearby tokens get similar rotations (strong attention), distant tokens get different rotations (weaker attention). And unlike absolute position embeddings, RoPE generalizes to sequence lengths the model hasn't seen during training.
-
-### RMSNorm and GELU
-
-**RMSNorm** normalizes each vector to prevent numbers from growing too large or too small through layers. Without normalization, values compound through layers — a value of 1.01 becomes 1.01^32 ≈ 1.37 after 32 operations, while 0.99 becomes 0.99^32 ≈ 0.72. Over a 4-layer transformer with 8 operations per layer, this drift is catastrophic.
-
-RMSNorm is simpler than the more common LayerNorm — it normalizes by root-mean-square without centering:
+The formula is:
 
 ```
-RMSNorm(x) = x / sqrt(mean(x²) + ε) × weight
+RmsNorm(x) = x / sqrt(mean(x^2) + epsilon) * gamma
 ```
 
-Just a volume knob keeping the signal clean.
+Where:
+- `x` is the input vector (the last dimension of shape `(batch, seq, d_model)`)
+- `mean(x^2)` is the mean of the squared elements along the d_model dimension
+- `epsilon = 1e-6` prevents division by zero
+- `gamma` is a learnable scale parameter (initialized to 1.0)
 
-**GELU** (Gaussian Error Linear Unit) is the activation function in the MLP. It's a smooth gate that mostly lets positive values through and mostly blocks negative values, with a soft transition around zero:
+This differs from the more common LayerNorm in two ways: it does not subtract
+the mean (no centering), and it uses the root mean square instead of variance.
+RmsNorm is slightly faster and has been shown to work equally well in practice.
 
-```
-GELU(x) ≈ x × 0.5 × (1 + tanh(sqrt(2/π) × (x + 0.044715x³)))
-```
-
-Why not just ReLU (max(0, x))? Because GELU's smooth curve allows small negative values through, giving the model more expressiveness. The difference matters more at small model sizes — GESTALT is small enough that every bit of expressiveness counts.
-
-### Important: candle-nn Bugs
-
-Two critical bugs in candle-nn v0.8.4 broke GESTALT for 12 training runs (see [The Bug Graveyard](#17-the-bug-graveyard) for the full story):
-
-- `candle_nn::RmsNorm` **silently kills the gradient graph**. Tensors passing through it become dead ends for backpropagation. The model compiles, runs, and reports decreasing loss — but only the final layer actually learns.
-
-- `candle_nn::ops::softmax_last_dim` **same problem**. Breaks the gradient chain inside attention.
-
-Both were replaced with custom implementations (`GradRmsNorm` and `grad_softmax_last_dim` in transformer.rs) using only basic tensor ops that correctly propagate gradients. This experience is described in detail in The Training Story.
-
-### GESTALT's Configurations
-
-| Parameter | Test | Default (d=512) | Target (d=1024) |
-|-----------|------|-----------------|------------------|
-| d_model   | 64   | 512             | 1024             |
-| n_layers  | 1-2  | 4               | 8                |
-| n_heads   | 2-4  | 8               | 8                |
-| d_ff      | 128  | 2048            | 4096             |
-| max_seq   | 128  | 256             | 512              |
-
-"Test" is for unit tests — tiny enough to run in milliseconds on CPU. We run 127 tests on every change, so these need to be fast. "Default" is what we train on now. "Target" is where we're heading.
-
----
-
-## 7. The Brain
-
-The `Brain` struct is GESTALT's central nervous system. It lives in `brain.rs` (~2,000 lines — the largest file in the project, and for good reason).
-
-### Why One Brain?
-
-In V4, two separate models processed the same input into different vector spaces. Like having two translators who both read your email but translate into different languages — they can't share notes. If the policy brain learns that "check the build" means "run cargo test," that knowledge doesn't help the language brain generate a response about test results.
-
-V5 has ONE encoder. The concept_vec it produces feeds:
-- Policy heads (deciding intent and actions)
-- The planner (as a prefix for plan generation)
-- The language decoder (as a prefix for text generation)
-- Memory (as a key for storage and retrieval)
-
-One understanding. Multiple uses. When the encoder learns what "check the build" means, EVERY downstream component benefits.
-
-### The Struct
+**The candle bug.** As described earlier, candle-nn's built-in `RmsNorm`
+implementation breaks the autograd computation graph. GESTALT uses a custom
+`GradRmsNorm` that computes the exact same operation using only basic tensor
+ops with working backward passes:
 
 ```rust
-Brain {
-    encoder: WiredTransformer,          // text → concept_vec
-    projector: Linear,                  // concept_vec → 16 prefix tokens
-    language_decoder: WiredTransformer,  // prefix → response text
-    policy_intent: Linear,              // intent classification
-    policy_actions: Linear,             // tool sequence prediction
-    policy_patterns: Linear,            // search patterns
-    policy_files: Linear,               // file targets
-    policy_picks: Linear,               // result selection
-    memory_projector: Linear,           // memory → decoder prefix
-    memory_bank: MemoryBank,            // in-memory episodic store
+pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    let variance = x.sqr()?.mean_keepdim(D::Minus1)?;
+    let rms = (variance + self.eps)?.sqrt()?;
+    let normed = x.broadcast_div(&rms)?;
+    normed.broadcast_mul(&self.weight)
 }
 ```
 
-Every field here is a neural network component with learnable weights. The total parameter count at d=512 is ~50 million. At d=1024 it'll be ~200 million. Every one of those parameters gets a gradient during training. Every one contributes to the brain's understanding.
+Each of these operations (sqr, mean_keepdim, sqrt, broadcast_div, broadcast_mul)
+has a correct autograd implementation in candle-core. By composing them
+explicitly rather than relying on the higher-level wrapper, gradient flow
+is preserved.
 
-### The Forward Pass
+### Multi-Head Self-Attention
 
-When a goal comes in, the Brain processes it in sequence:
+Attention is the mechanism by which each position in the sequence gathers
+information from every other position. It uses three projections: Query (Q),
+Key (K), and Value (V).
 
-```
-1. Tokenize: goal → token_ids
-2. Embed: token_ids → embeddings (1, seq_len, d_model)
-3. Encode: embeddings → hidden states → mean pool → concept_vec (1, d_model)
-4. Project: concept_vec → prefix (1, 16, d_model)
-5. Branch:
-   a. Policy: concept_vec → 5 classification heads (parallel)
-   b. Memory: concept_vec → cosine search → top-K → memory prefix
-   c. Decode: [prefix; memory_prefix; BOS] → autoregressive generation
-```
+The intuition: imagine a position wants to find relevant context. It formulates
+a question (the Query), every other position advertises what it knows (the Key),
+and once a match is found, the relevant information (the Value) is retrieved.
+It is like a soft version of a database lookup, where instead of matching
+exactly, you get a weighted average based on similarity.
 
-Steps 5a, 5b, and 5c can run in parallel — they all read from the same concept_vec. In practice, we run them sequentially because they're fast enough and it keeps the code simple.
+#### The Math
 
----
-
-## 8. The Policy Heads
-
-When the brain receives a goal, the first thing it does is classify: what *kind* of task is this? Five linear heads answer five questions from the same concept_vec, in a single forward pass (~1ms on GPU).
-
-### The Five Questions
-
-**Intent Head (16 classes):** "What category of task is this?"
+For each attention head:
 
 ```
-Hello        → greeting, needs a friendly response
-RunTests     → cargo test, needs tool execution
-CargoCheck   → type checking, needs tool execution
-RepoSearch   → find something in the code
-RepoRead     → read a specific file
-Composite    → multi-step task (search THEN read)
-Memory       → store or recall information
-... and 8 more
+Q = x @ W_q        shape: (batch, seq, head_dim)
+K = x @ W_k        shape: (batch, seq, head_dim)
+V = x @ W_v        shape: (batch, seq, head_dim)
+
+scores = Q @ K^T / sqrt(head_dim)    shape: (batch, seq, seq)
+weights = softmax(scores + mask)      shape: (batch, seq, seq)
+output = weights @ V                  shape: (batch, seq, head_dim)
 ```
 
-**Action Head (6 slots × 15 tools + END):** "Which tools, in which order?"
+Where:
+- `W_q, W_k, W_v` are learned projection matrices (no bias, following modern practice)
+- `head_dim = d_model / n_heads` (512 / 8 = 64 per head)
+- The division by `sqrt(head_dim)` prevents the dot products from growing too
+  large, which would push softmax into saturation where gradients vanish
+- `mask` is the causal mask (described below)
+- `softmax` converts raw scores into a probability distribution
+
+**Multi-head:** Instead of running one attention computation with the full
+d_model=512 dimension, GESTALT runs 8 independent attention computations
+("heads") with dimension 64 each, then concatenates the results. This lets
+different heads learn to attend to different types of relationships -- one
+head might focus on nearby tokens (local syntax), another on long-range
+dependencies (semantic coherence).
 
 ```
-"search for the GPU policy code and then open it":
-  Slot 0: rg          (search tool)
-  Slot 1: repo_read   (file reader)
-  Slot 2: END         (no more tools)
-  Slot 3-5: PAD       (unused)
+head_1 = Attention(Q_1, K_1, V_1)    (batch, seq, 64)
+head_2 = Attention(Q_2, K_2, V_2)    (batch, seq, 64)
+...
+head_8 = Attention(Q_8, K_8, V_8)    (batch, seq, 64)
+
+concat = [head_1; head_2; ...; head_8]   (batch, seq, 512)
+output = concat @ W_o                     (batch, seq, 512)
 ```
 
-**Pattern Head:** Which search pattern to use (for ripgrep queries).
-**File Head:** Which file to target (from a fixed catalog).
-**Pick Head:** Which search result to select (first match, best match, etc.).
+The output projection `W_o` remixes the concatenated heads back into the
+d_model space.
 
-All five decisions happen simultaneously from the same concept_vec. One forward pass, five answers. Think of it as five specialists reading the same sticky note and each writing their answer on a different part of the form.
-
-### The Curriculum
-
-The policy is trained on 64 tasks: 16 core (one per intent) + 48 variations (paraphrases, edge cases).
-
-```
-Core tasks (one per intent):
-  "hello"                              → Hello, talk
-  "run the tests"                      → RunTests, cargo_test
-  "search jarviscmd"                   → RepoSearch, rg
-  "search jarviscmd and then open it"  → Composite, rg + repo_read
-  ...
-
-Variations:
-  "hi there"                           → Hello (paraphrase)
-  "hey"                                → Hello (informal)
-  "check for compilation errors"       → CargoCheck (paraphrase)
-  "do a type check"                    → CargoCheck (different phrasing)
-  ...
-```
-
-Training runs for 16,384 steps with weighted cross-entropy. The policy converges quickly — 64 tasks with 256-dimensional embeddings is a very learnable problem. We consistently hit 64/64 accuracy.
-
----
-
-## 9. The Planner
-
-The planner generates executable tool plans with a guarantee that no other system has: **every plan is syntactically valid**, always.
-
-### The Problem
-
-A regular language model might produce:
-```
-STEP rg STEP STEP repo_read EOP
-```
-That's nonsense. Two STEPs in a row? An rg without a search pattern? Regular models don't know the grammar of valid plans. They produce sequences that *look* like plans but can't actually be parsed or executed.
-
-This is a real problem. ChatGPT using function calling regularly produces malformed JSON. Claude sometimes generates tool calls with wrong parameter names. These systems treat tool use as a language problem — generating text that happens to look like a tool invocation. GESTALT treats it as a grammar problem.
-
-### The Solution: FSM-Constrained Decoding
-
-GESTALT's planner has a **17-state finite state machine** tracking where it is in the plan grammar. At each step, the FSM says: "Given the current state, these are the only tokens that are legal right now." All illegal tokens get set to -infinity probability.
-
-```
-State Machine (simplified):
-
-  Start ──[STEP]──→ AfterStep ──[action]──→ AfterAction
-                                                 |
-                    ┌─[has args]──→ AfterRhs ──[arg]──→ ...
-                    └─[no args]──→ Complete? ──[STEP or EOP]──→ ...
-```
-
-The full state machine has 17 states:
-
-```
- 0. Start           → only STEP is legal
- 1. AfterStep       → only action tokens (rg, repo_read, etc.) are legal
- 2. AfterAction     → depends on which action: some need args, some don't
- 3. AfterRhs        → argument value expected (PAT0-PAT5, FILE0-FILE9, etc.)
- 4. AfterPat        → STEP or EOP (plan complete or more steps)
- 5. AfterFile       → STEP, EOP, or FROM (chain from previous step)
- ...
-16. Error           → unreachable if FSM is correct (assertion failure)
-```
-
-Think of it like Scrabble where after each word, the rules physically remove certain letters from your rack. You CAN'T make an illegal move because the illegal pieces aren't available.
-
-### Why It Matters
-
-The model might choose the *wrong* action (predicting `rg` when it should be `cargo_test`), but it will never produce a *syntactically invalid* plan. Every plan can be parsed and executed. This eliminates an entire class of failures.
-
-In V3, this was the difference between a system that worked and a system that crashed. 21/21 plans parse correctly — every single time.
-
-### The STEP Token Problem
-
-This is one of our favorite debugging stories (M-002 in the failure log).
-
-STEP tokens make up ~27% of plan tokens but carry almost no information — they're just separators, like commas in a list. Without weighting, the model learns to predict STEP perfectly while ignoring the important action tokens:
-
-```
-Before weighting:
-  STEP prediction accuracy: 99.8%
-  Action prediction accuracy: 0.7%    ← model gives up on these
-  Overall loss: looks fine (mostly STEPs are correct)
-
-After weighting (STEP=0.1, action=1.0):
-  STEP prediction accuracy: 99.5%    ← barely changed
-  Action prediction accuracy: 94.2%   ← now it actually learns
-```
-
-Three lines of code. The fix was trivial. Finding it took 30+ experiments because we were looking in the wrong place — tuning learning rates, architectures, training schedules — when the problem was that the loss function was incentivizing the wrong behavior.
-
----
-
-## 10. The Executor
-
-GESTALT runs tools locally — not in a remote sandbox. This is one of the things that makes it fundamentally different from API-based AI assistants.
-
-### Real Subprocesses
-
-Each of the 15 built-in tools is a real subprocess with a 30-second timeout:
-
-| Tool | What It Does | Safety |
-|------|-------------|--------|
-| rg | Ripgrep search | ReadOnly |
-| repo_read | Read a file | ReadOnly |
-| repo_list | List directory | ReadOnly |
-| cargo_test | Run tests | Meta |
-| cargo_check | Type check | Meta |
-| cargo_clippy | Lint check | Meta |
-| memory_add | Store memory | Mutating |
-| memory_search | Search memories | ReadOnly |
-| patch_dry_run | Test a patch | Mutating |
-| patch_apply | Apply a patch | Mutating |
-| talk | Generate response | Meta |
-| ... | 4 more | Various |
-
-### Safety Levels
-
-**Safety levels** are real, not theatre.
+**Gradient-safe softmax.** Just like RmsNorm, candle-nn's built-in softmax
+has a broken backward pass. GESTALT uses a custom implementation:
 
 ```rust
-enum SafetyLevel {
-    ReadOnly,   // Can't modify anything. Ever.
-    Meta,       // Runs analysis but could have side effects (cargo test might write artifacts)
-    Mutating,   // Actually changes files. Requires explicit allow_writes: true.
+fn grad_softmax_last_dim(x: &Tensor) -> Result<Tensor> {
+    let max = x.max_keepdim(D::Minus1)?;        // numerical stability
+    let shifted = x.broadcast_sub(&max)?;         // subtract max
+    let exp = shifted.exp()?;                      // exponentiate
+    let sum = exp.sum_keepdim(D::Minus1)?;        // normalizing constant
+    exp.broadcast_div(&sum)                        // normalize to probabilities
 }
 ```
 
-Like Unix file permissions — you have to grant `rw-` before the action, not after. A Mutating tool called without `allow_writes: true` will refuse to execute. Not warn. Not ask. Refuse.
+The `max` subtraction is a standard numerical trick: softmax is invariant to
+adding a constant, and subtracting the maximum prevents the exponentials from
+overflowing to infinity.
 
-### Timeout and Isolation
+#### The Causal Mask
 
-Every tool runs in its own subprocess. If it hangs, the 30-second timeout kills it. The main brain process is never at risk.
+Language models generate text left-to-right: each token predicts the next one.
+During training, the model sees the entire sequence at once (for efficiency),
+but position `i` must not be allowed to see tokens at positions `i+1, i+2, ...`
+because those are the tokens it is trying to predict.
 
-```
-Brain Process (long-running, holds all neural network weights in VRAM)
-    |
-    ├── subprocess: rg "jarviscmd" ./src   (timeout: 30s)
-    |       → stdout: "src/main.rs:42: fn jarviscmd"
-    |       → exit_code: 0
-    |
-    ├── subprocess: cargo test             (timeout: 30s)
-    |       → stdout: "test result: 127 passed; 0 failed"
-    |       → exit_code: 0
-    |
-    └── subprocess: repo_read src/main.rs  (timeout: 30s)
-            → stdout: file contents
-            → exit_code: 0
-```
-
-If `cargo test` takes 45 seconds, it gets killed. The brain logs "tool timed out" and continues with the next step. No hanging, no deadlocks, no infinite loops.
-
----
-
-## 11. The Language Decoder
-
-The decoder is how GESTALT talks back to you. It's a causal transformer (same architecture as the encoder, different weights) that generates text one token at a time.
-
-### How It Works
-
-The decoder sees a composite input: concept tokens (what the user wants), memory tokens (what the brain remembers), and the response so far:
+The causal mask enforces this constraint. It is a square matrix where position
+`(i, j)` is 0 if `j <= i` (allowed to attend) and negative infinity if `j > i`
+(forbidden). Adding this mask before softmax forces the forbidden positions to
+have zero attention weight.
 
 ```
-What the decoder sees:
-  Position 0-15:   [concept prefix]     "Here's what the user wants"
-  Position 16-23:  [memory prefix]      "Here's what I remember" (up to 8)
-  Position 24:     [BOS]                Start generating
-  Position 25+:    [response tokens]    Generated one at a time
+Causal mask for seq_len=5:
+
+       pos 0   pos 1   pos 2   pos 3   pos 4
+pos 0 [  0      -inf    -inf    -inf    -inf  ]
+pos 1 [  0       0      -inf    -inf    -inf  ]
+pos 2 [  0       0        0     -inf    -inf  ]
+pos 3 [  0       0        0       0     -inf  ]
+pos 4 [  0       0        0       0       0   ]
 ```
 
-Generation is autoregressive — each new token depends on all previous ones:
-
-```
-Step 1: [...prefix...][BOS]                              → predicts "H"
-Step 2: [...prefix...][BOS][H]                           → predicts "e"
-Step 3: [...prefix...][BOS][He]                          → predicts "l"
-...
-Step N: [...prefix...][BOS][Hello. What can I do for you] → predicts EOS
-```
-
-At each step, the decoder produces a probability distribution over all tokens in the vocabulary. "What's the most likely next token?" The sampling strategy (temperature, top-K, top-P) determines how we pick from that distribution.
-
-### From Bytes to Concept Tokens
-
-The decoder originally generated at **byte level** — each token was one of 256 bytes plus PAD, BOS, EOS (259 total). This works for any text (Unicode, code, special characters) but is slow — 100 characters requires 100 forward passes.
-
-Phase 2.5 upgraded to the **ConceptTokenizer** (see [Section 12](#12-the-tokenizer-story)), where common byte sequences are merged into single tokens. "Hello" becomes ~2-3 tokens instead of 5 bytes. Faster generation, better learning.
-
-### The Memory Prefix: V5's Key Innovation
-
-In V4, the decoder was trained WITHOUT memory, then memory was bolted on after training. The decoder never learned to look at memory tokens — it ignored them entirely.
-
-Here's why this fails: neural networks learn to attend to inputs that help predict the correct output. If memory tokens are present during training, the model learns "when the memory says 'user likes blue,' I should respond about blue." But if the model is trained for 25,000 steps WITHOUT memory, it learns to predict responses using ONLY the concept prefix and autoregressive context. Then when you bolt on memory, it's noise — the model has no reason to look at those tokens.
-
-In V5, the decoder trains WITH memory from epoch 0. During training, we randomly sample 0 to K previous dialogues and inject them as "memory prefix" tokens. The model learns that these tokens carry useful information because they correlate with the expected response.
-
-This was bug M-004 in V4. The fix cost zero code complexity — just feed the memory prefix during training, not just during inference.
-
-### Sampling: Temperature, Top-K, Top-P, and Repetition Penalty
-
-Raw generation produces a probability distribution. The sampling strategy determines how we pick from it.
-
-**Temperature (default 0.7):** Scales the logits before softmax. Temperature 0.0 = always pick the most probable token (greedy). Temperature 1.0 = sample proportionally to probability. Temperature 0.7 is a sweet spot — some randomness for variety, but still mostly picking the best options.
-
-```
-Before temperature:  [0.5, 0.3, 0.15, 0.05]     (raw probabilities)
-After temp=0.5:      [0.65, 0.24, 0.09, 0.02]    (sharper, more confident)
-After temp=1.5:      [0.38, 0.29, 0.21, 0.12]    (flatter, more random)
-```
-
-**Top-K (default 40):** Only consider the K most probable tokens. Everything below rank K gets masked to zero probability. Prevents low-probability garbage from being sampled.
-
-**Top-P / Nucleus Sampling (default 0.9):** Only consider tokens whose cumulative probability reaches P. This adapts to the model's confidence:
-
-```
-Confident prediction (model knows the answer):
-  Token probs: [0.85, 0.08, 0.04, 0.02, 0.01, ...]
-  At p=0.9: only top 2 tokens considered (0.85 + 0.08 = 0.93 ≥ 0.9)
-
-Uncertain prediction (multiple valid continuations):
-  Token probs: [0.15, 0.12, 0.10, 0.09, 0.08, 0.07, 0.06, ...]
-  At p=0.9: top 12 tokens considered (many options are viable)
-```
-
-This is smarter than fixed top-K because it automatically narrows the beam when the model is confident and widens it when uncertain.
-
-**Repetition Penalty (windowed, last 50 tokens):** Penalizes tokens that appeared recently. Without this, the model gets stuck in loops: "the the the the the." The penalty multiplies the probability of repeated tokens by a factor < 1.
-
-The window is important — earlier versions penalized across the entire generation, which meant common words like "the" and "is" got increasingly penalized as the response grew. With a 50-token window, only very recent repetitions are penalized.
-
----
-
-## 12. The Tokenizer Story
-
-This is one of GESTALT's most important evolution stories — and a key discovery about what makes language models learn effectively.
-
-### Phase 0-1: Byte Level (259 tokens)
-
-Originally, every character was its own token. "Hello" = 5 tokens: [H, e, l, l, o]. Simple, universal, but:
-
-1. **Slow**: 100 characters = 100 forward passes.
-2. **Hard to learn**: the model has to figure out that H+e+l+l+o is a greeting. It's learning spelling, grammar, vocabulary, and meaning simultaneously.
-3. **Sequence length limited**: with max_seq=256, you can only generate 256 bytes (~256 characters). Long responses get cut off.
-
-But it has one killer advantage: it works for EVERYTHING. Unicode emoji, code with special characters, filenames with weird extensions — all just bytes.
-
-### Phase 2: The ConceptTokenizer (BPE)
-
-The ConceptTokenizer learns **BPE merges** from the training corpus. BPE (Byte Pair Encoding) is the same algorithm used by GPT, but at much smaller scale:
-
-```
-Starting vocabulary: 256 bytes + PAD + BOS + EOS = 259 tokens
-
-Merge 1: Find most common byte pair in corpus
-         "t" + "h" occurs 847,293 times → new token "th" (ID 259)
-
-Merge 2: " " + "th" occurs 203,117 times → new token " th" (ID 260)
-
-Merge 3: "th" + "e" occurs 191,854 times → new token "the" (ID 261)
-
-...
-
-Merge 200: (some pair) → new token (ID 458)
-
-Final vocabulary: 459 tokens (259 base + 200 learned merges)
-```
-
-With 200 merges, "Hello" might become 2-3 tokens instead of 5. Common phrases compress even more. "what can you do" goes from 15 bytes to 8 tokens — nearly 2x compression.
-
-### The Key Discovery: Fewer Merges = Faster Learning
-
-This was a surprise. We expected more merges (bigger vocabulary) to help because each token carries more information. Instead:
-
-```
-Grid search at 300 training steps (val_loss @ step 200):
-  50 merges  (306 vocab):  val_loss = 2.79   ← best at short training
-  100 merges (356 vocab):  val_loss = 3.13
-  200 merges (459 vocab):  val_loss = 3.56
-  500 merges (759 vocab):  val_loss = 4.08
-  1000 merges (1259 vocab): val_loss = 4.70
-  2000 merges (2259 vocab): val_loss = 5.53  ← worst
-```
-
-**Why?** More tokens = larger embedding table = more parameters to learn from the same data. Each token in the vocabulary gets its own 512-dimensional embedding vector. With 459 tokens, that's 459 × 512 = 235,008 embedding parameters, and each token appears often enough in the training data (21K pairs) to learn a good embedding. With 2,259 tokens, that's 1,156,608 embedding parameters, and rare tokens appear too few times to learn meaningful embeddings.
-
-It's like learning a language. If someone tells you 200 new words with 100 example sentences each, you'll learn them well. If someone tells you 2,000 new words with 10 example sentences each, you'll barely remember any of them.
-
-**Sweet spot: 200 merges** (459 tokens, ~2x compression ratio). Below 150 approaches byte-level. Above 500, the model can't learn enough per token. The curve is flat between 180-220 merges — diminishing returns around 200.
-
-### Grid Search Infrastructure
-
-To find this sweet spot, we built grid search infrastructure with environment variables that override the compiled-in config:
-
-```bash
-# Quick 300-step sweep (takes ~2 min per setting)
-GESTALT_MERGES=50   GESTALT_SFT_STEPS=300 ./target/release/gestalt train --config default
-GESTALT_MERGES=100  GESTALT_SFT_STEPS=300 ./target/release/gestalt train --config default
-GESTALT_MERGES=200  GESTALT_SFT_STEPS=300 ./target/release/gestalt train --config default
-GESTALT_MERGES=500  GESTALT_SFT_STEPS=300 ./target/release/gestalt train --config default
-GESTALT_MERGES=1000 GESTALT_SFT_STEPS=300 ./target/release/gestalt train --config default
-GESTALT_MERGES=2000 GESTALT_SFT_STEPS=300 ./target/release/gestalt train --config default
-```
-
-This was crucial — being able to sweep hyperparameters WITHOUT recompiling saved hours per experiment.
-
-### Tokenizer Bootstrap: From 83 Minutes to 2 Seconds
-
-The original tokenizer bootstrap was painfully slow. Here's why:
-
-The "concept-aware" scoring tried to measure semantic similarity between byte pairs by running them through the neural encoder:
-
-```
-For each candidate merge (byte_a + byte_b):
-  For each occurrence in the corpus:
-    encoded_a = encoder.forward(byte_a)
-    encoded_ab = encoder.forward(byte_a + byte_b)
-    score += cosine_similarity(encoded_a, encoded_ab)
-```
-
-With 3,000 training pairs and 8.6 million n-gram occurrences, this meant 8.6 million encoder forward passes. At ~1ms each → 83+ minutes.
-
-The discovery: **this was completely pointless**. The context-free encoder produces the same vector for the same bytes regardless of surrounding context. `cosine_similarity(encode("th"), encode("th"))` = 1.0, always. The scoring reduced to: `score = frequency × compression`. Pure BPE, no neural component needed.
-
-New tokenizer bootstrap: 2 seconds. Same merge quality. The "concept-aware" scoring is kept as dead code for when we build a context-dependent encoder (future work).
-
----
-
-## 13. The Corpus Pipeline
-
-Training data is the fuel. GESTALT's corpus pipeline is a 1,050-line Python script (`scripts/build_corpus.py`) that transforms public datasets into JARVIS-style dialogue pairs.
-
-### The Sources
-
-Three public datasets form the base:
-
-**Dolly (Databricks):** ~15K instruction-following pairs. High quality but formal tone. Good for factual and technical Q&A.
-
-**OASST2 (Open Assistant):** ~10K conversational turns. More natural, more varied, but sometimes too casual or too long.
-
-**Alpaca (Stanford):** ~52K diverse instruction pairs. Generated by GPT-3.5, so there's a distinctive "AI assistant" voice we need to filter.
-
-### The Processing Pipeline
-
-```
-Raw data (~77K pairs across 3 sources)
-    ↓ Download and parse (JSONL, Parquet)
-    ↓ Extract (input, response) pairs
-    ↓ Deduplication (exact + near-duplicate detection)
-    ↓ Length filtering (too short → useless, too long → training noise)
-    ↓ Quality filtering (remove garbled, non-English, code-only)
-    ↓ JARVIS voice augmentation (rephrase responses in JARVIS style)
-    ↓ Category tagging (greeting, technical, philosophical, etc.)
-Result: 21,786 unique dialogue pairs (v19/v22 corpus)
-```
-
-### The v23 Expansion: More Isn't Always Better
-
-For v23, we expanded aggressively — adding SlimOrca, UltraChat, and WizardLM datasets. The corpus ballooned from 21K to 92K pairs (4.2x expansion).
-
-The results were instructive — and sobering.
-
-**v22 (21K pairs, 30K steps, val_loss≈1.9):**
-```
-"good morning"       → "Morning! How'd you sleep?"
-"The build broke"    → "Step one: read the error message. The whole thing, not just the last line."
-"tell me about yourself" → "I'm a language model with opinions, a dry sense of humor..."
-```
-
-**v23 (92K pairs, 11K steps, val_loss≈1.88):**
-```
-"good morning"       → (long ramble about surfaces and codes)
-"The build broke"    → (something about Chicago plants)
-"what is a transformer" → "A low-free problem is a constant system..."
-```
-
-v23 had BETTER loss (1.88 vs 1.9) but WORSE output. The grammar was almost perfect — no broken tokens, no spelling errors. But the responses had no personality. They sounded like a generic AI assistant, not JARVIS.
-
-**The lesson: corpus quality > corpus quantity.** The 92K corpus was dominated by generic instruction-following data. SlimOrca teaches the model to sound like ChatGPT. UltraChat teaches it to sound like a textbook. WizardLM teaches it to sound like a professor. None of them teach it to sound like JARVIS.
-
-21K pairs with JARVIS voice > 92K pairs with committee voice.
-
-This is now rule M-044 in our failure log: **when scaling data, maintain personality density.** The next expansion will filter much more aggressively — keep only pairs that match JARVIS's voice profile, even if that means a smaller corpus.
-
-### The Gold Corpus: Original JARVIS Pairs
-
-The earliest and most important data is the "gold corpus" — ~242 hand-curated JARVIS dialogue pairs:
-
-```
-"hello"
-  → "Hello, sir. What can I do for you?"
-
-"What is beauty?"
-  → "Pattern recognition with emotional payoff. Your brain rewards you for finding
-     structure in chaos — a sunset, a proof, a face. Beauty is the reward signal."
-
-"good evening"
-  → "Evening. I take it we have work to do?"
-
-"What do you think about Neon Genesis Evangelion?"
-  → "A mecha show that's actually about depression, parental abandonment, and the
-     hedgehog's dilemma. Hideaki Anno poured his clinical depression into 26 episodes
-     and accidentally created a cultural touchstone."
-```
-
-These set the personality target. The rest of the corpus should sound like more of THIS, not less.
-
----
-
-## 14. Memory
-
-GESTALT has two memory systems: fast in-memory retrieval during inference, and persistent SQLite storage across sessions.
-
-### Why Memory Matters
-
-This is where GESTALT diverges most fundamentally from existing AI assistants. ChatGPT, Claude, Gemini — none of them remember you between sessions. Every conversation starts from zero. The workarounds (conversation history, RAG, user profiles) are all external to the model.
-
-GESTALT's memory is internal. The concept_vec used to store a memory is the same concept_vec used during inference. When you tell GESTALT your favorite color is blue, it stores the concept vector of that conversation. When you ask about your favorite color later, the query concept vector is similar to the stored one — cosine similarity matches them. No external lookup table. No keyword matching. Pure neural similarity.
-
-### In-Memory Bank
-
-The MemoryBank stores recent experiences as concept vectors. When a new goal comes in, we compute its concept_vec and find the K stored vectors most similar to it using **cosine similarity**:
-
-```
-cosine_sim = dot(A, B) / (|A| × |B|)
-```
-
-Two vectors pointing the same direction = similarity 1.0 (identical meaning). Perpendicular = 0.0 (unrelated). Opposite = -1.0.
-
-Think of memories as stars in the sky. When you ask a question, you point your telescope at the concept_vec direction. The closest stars are the most relevant memories.
-
-### How Memory Flows Through the Decoder
-
-Retrieved memories aren't just metadata. They're projected through a learned `memory_projector` and prepended to the decoder's prefix:
-
-```
-Without memory:
-  Decoder input: [concept_prefix(16 tokens)][BOS][response...]
-
-With 3 memories:
-  Decoder input: [concept_prefix(16 tokens)][mem_0][mem_1][mem_2][BOS][response...]
-```
-
-Each memory token is a 512-dimensional vector that the decoder's attention mechanism can attend to. When generating "Your favorite color is blue," the decoder can attend to the memory token from the previous conversation where you said "I like blue."
-
-### Persistent Store (SQLite)
-
-The `EpisodicMemory` wraps SQLite for disk persistence:
-
-```sql
-CREATE TABLE episodes (
-    id INTEGER PRIMARY KEY,
-    timestamp TEXT,
-    concept_vec BLOB,    -- 512 × 4 = 2,048 bytes of raw f32
-    goal TEXT,           -- what the user asked
-    response TEXT,       -- what GESTALT said
-    success INTEGER      -- did the task succeed?
-);
-```
-
-Tell GESTALT your favorite color in session 1, kill the process, restart it a week later, ask about it in session 100, and it will remember. The concept_vec is stored as raw f32 bytes — no serialization overhead, no precision loss.
-
-### Capacity: 1,024 entries, FIFO eviction
-
-When full, the oldest memory is deleted. This is the simplest eviction policy and works for now. Phase 5 will add **consolidation** — detecting patterns across episodes:
-
-```
-Episode 1: "What's my favorite color?" → "Blue" (success)
-Episode 17: "Do I like blue?" → "Yes, you mentioned it" (success)
-Episode 42: "What colors do I like?" → "Blue, definitely" (success)
-
-Consolidation: abstract fact: "User's favorite color = blue" (stored once, not three times)
-```
-
-### Cross-Session Persistence: The Integration Test
-
-This is how we verify memory actually survives process restarts:
+After softmax, the -inf entries become exactly 0.0, and each row sums to 1.0
+over only the allowed positions.
+
+**Precomputation.** GESTALT precomputes the causal mask once at model
+initialization for the maximum sequence length (256), then slices it to the
+actual sequence length during each forward pass. This avoids a per-call
+allocation and a host-to-device memory transfer on every training step.
 
 ```rust
-#[test]
-fn test_cross_session_memory_persistence() {
-    // Session 1: store memories
-    let db_path = temp_db();
-    {
-        let mut mem = EpisodicMemory::open(&db_path).unwrap();
-        mem.store("favorite color is blue", concept_vec_blue, "Noted!", true);
-        mem.store("I like rust programming", concept_vec_rust, "Good taste.", true);
-    }  // EpisodicMemory dropped, connection closed
+let causal_mask = build_causal_mask(cfg.max_seq_len, device)?;
+// ... during forward:
+let mask = causal_mask.narrow(2, 0, s)?.narrow(3, 0, s)?;
+```
 
-    // Session 2: retrieve from fresh connection
-    {
-        let mem = EpisodicMemory::open(&db_path).unwrap();
-        let results = mem.retrieve_recent(10);
-        assert_eq!(results.len(), 2);
-        assert!(results[0].goal.contains("favorite color"));
+### Rotary Position Embeddings (RoPE)
+
+Transformers are fundamentally position-agnostic: the attention mechanism
+operates on sets, not sequences. Without positional information, the model
+cannot distinguish "the cat chased the dog" from "the dog chased the cat."
+
+GESTALT uses Rotary Position Embeddings (RoPE), which encode positions by
+rotating the query and key vectors before computing attention scores. This
+is elegant because it encodes *relative* positions: the attention score
+between positions `i` and `j` depends only on their distance `|i - j|`,
+not their absolute positions.
+
+#### The Math
+
+RoPE works by splitting each head's Q and K vectors into pairs of elements,
+then rotating each pair by an angle that depends on the position.
+
+First, precompute rotation frequencies:
+
+```
+theta_k = 1 / 10000^(2k / head_dim)    for k = 0, 1, ..., head_dim/2 - 1
+```
+
+This creates a geometric sequence of frequencies, from high frequency
+(k=0, theta = 1.0) to low frequency (k=31, theta ~ 2.7e-5 for head_dim=64).
+
+For position `p`, the rotation angle for dimension pair `k` is:
+
+```
+angle_{p,k} = p * theta_k
+```
+
+Then split the vector into first and second halves:
+
+```
+x = [x_1, x_2]    each of dimension head_dim/2
+
+rotated = [x_1 * cos(angle) - x_2 * sin(angle),
+           x_2 * cos(angle) + x_1 * sin(angle)]
+```
+
+This is literally a 2D rotation applied independently to each pair of
+dimensions. Low-frequency dimensions rotate slowly (encoding long-range
+position differences), while high-frequency dimensions rotate quickly
+(encoding nearby position differences).
+
+#### Implementation
+
+```rust
+fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    let half = x.dim(D::Minus1)? / 2;
+    let x1 = x.narrow(D::Minus1, 0, half)?;      // first half
+    let x2 = x.narrow(D::Minus1, half, half)?;    // second half
+
+    let cos = cos.narrow(0, 0, seq_len)?.unsqueeze(0)?.unsqueeze(0)?;
+    let sin = sin.narrow(0, 0, seq_len)?.unsqueeze(0)?.unsqueeze(0)?;
+
+    let rotated_x1 = (x1 * cos - x2 * sin)?;
+    let rotated_x2 = (x2 * cos + x1 * sin)?;
+    Tensor::cat(&[rotated_x1, rotated_x2], D::Minus1)
+}
+```
+
+The cos and sin tables are precomputed once at model initialization for all
+positions up to max_seq_len (256), then sliced to the actual sequence length
+during each forward pass.
+
+#### YaRN: Context Extension Beyond Training Length
+
+Standard RoPE is trained with a fixed maximum sequence length (256 for
+GESTALT's current training). If the model encounters a longer sequence at
+inference time, the rotational frequencies exceed anything seen during
+training, and attention patterns break down. The model has learned to
+associate certain rotation angles with certain relative distances, but
+rotations beyond the training range produce meaningless position signals.
+
+GESTALT implements YaRN (Yet another RoPE extensioN), a frequency-selective
+scaling method that extends the effective context window without retraining.
+The key insight is that not all RoPE dimensions are equally affected by
+longer sequences.
+
+**The three frequency bands.** Each dimension pair `k` in the RoPE table
+has a corresponding wavelength:
+
+```
+wavelength_k = 2 * pi / theta_k = 2 * pi * 10000^(2k / head_dim)
+```
+
+A dimension with wavelength shorter than the training length can already
+distinguish all positions within the training window -- it has completed
+multiple full rotations. Stretching it would distort the fine-grained
+local position information it encodes. A dimension with wavelength much
+longer than the training length has barely rotated during training -- it
+needs to be stretched to cover the extended range.
+
+YaRN classifies dimensions into three bands:
+
+```
+For each dimension pair k with wavelength w_k:
+
+  High-frequency (w_k < L_train):
+    theta_yarn_k = theta_k                         (unchanged)
+
+  Low-frequency (w_k > L_train * beta):
+    theta_yarn_k = theta_k * (1 / scale_factor)    (NTK-scaled)
+
+  Mid-frequency (L_train <= w_k <= L_train * beta):
+    t = (w_k - L_train) / (L_train * (beta - 1))
+    theta_yarn_k = theta_k * (1-t) + theta_ntk_k * t   (linear ramp)
+```
+
+Where:
+- `L_train` is the maximum sequence length seen during training (`max_train_len`)
+- `beta = 2.0` controls the width of the transition band
+- `scale_factor = L_test / L_train` is the ratio of test to train sequence lengths
+- `theta_ntk_k` is the NTK-scaled frequency: `1 / base_scaled^(2k / head_dim)`
+- `base_scaled = 10000 * scale_factor^(d / (d-2))` where `d = head_dim`
+
+The NTK (Neural Tangent Kernel) scaling adjusts the base frequency rather
+than linearly interpolating positions. This preserves the relative spacing
+between dimensions -- if dimension `k` was 10x the frequency of dimension
+`k+1`, that ratio is maintained after scaling.
+
+**The linear ramp** in the mid-frequency band provides a smooth transition.
+Without it, there would be a discontinuity at the band boundary where some
+dimensions suddenly jump from unscaled to fully NTK-scaled. The ramp ensures
+that nearby dimensions receive similar treatment.
+
+```rust
+fn precompute_rope(seq_len: usize, head_dim: usize, max_train_len: usize, device: &Device)
+    -> Result<(Tensor, Tensor, f32)>
+{
+    let scale = seq_len as f32 / max_train_len as f32;
+
+    let theta: Vec<f32> = if seq_len > max_train_len {
+        let beta = 2.0f32;
+        let base_scaled = 10000.0 * scale.powf(head_dim as f32 / (head_dim as f32 - 2.0));
+
+        (0..half).map(|i| {
+            let freq_orig = 1.0 / 10000f32.powf(2.0 * i as f32 / head_dim as f32);
+            let freq_scaled = 1.0 / base_scaled.powf(2.0 * i as f32 / head_dim as f32);
+            let wavelength = 2.0 * PI / freq_orig;
+
+            if wavelength < max_train_len as f32 {
+                freq_orig                              // high-freq: unchanged
+            } else if wavelength > max_train_len as f32 * beta {
+                freq_scaled                            // low-freq: NTK-scaled
+            } else {
+                let t = (wavelength - max_train_len as f32)
+                    / (max_train_len as f32 * (beta - 1.0));
+                freq_orig * (1.0 - t) + freq_scaled * t  // mid-freq: ramp
+            }
+        }).collect()
+    } else {
+        // Standard RoPE when within training range
+        (0..half).map(|i| 1.0 / 10000f32.powf(2.0 * i as f32 / head_dim as f32)).collect()
+    };
+    // ...
+}
+```
+
+**When does YaRN activate?** Only when `seq_len > max_train_len`. During
+training (where sequence lengths are within the trained range), standard
+RoPE is used unchanged. YaRN is a pure inference-time enhancement. The
+`max_train_len` field in `TransformerConfig` records the training context
+window so the model knows when scaling is needed.
+
+**Attention temperature compensation.** When extending the context window,
+the entropy of attention distributions increases -- each position has more
+candidates to attend to. This makes attention weights "flatter," reducing
+the model's ability to focus sharply on relevant positions.
+
+YaRN compensates by scaling the attention logits with a temperature factor:
+
+```
+attn_temp = sqrt(L_test / L_train)    when L_test > L_train
+attn_temp = 1.0                        when L_test <= L_train
+
+attention_logits = (Q @ K^T) / (sqrt(head_dim) * attn_temp)
+```
+
+This is mathematically equivalent to dividing the softmax temperature by
+`sqrt(scale)`, sharpening the attention distribution to compensate for the
+increased number of keys. At 2x the training length, `attn_temp = sqrt(2)
+= 1.414`, which slightly sharpens attention. At 4x, `attn_temp = 2.0`,
+which more aggressively concentrates attention on the most relevant keys.
+
+The temperature factor is stored in the `WiredTransformer` struct and passed
+through the attention computation:
+
+```rust
+let scale = (self.head_dim as f64).sqrt() * attn_temp as f64;
+let attn = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
+let attn = (attn / scale)?;
+```
+
+#### RoPE Prefix Decoupling
+
+GESTALT's decoder receives prefix tokens (concept projections) that are
+NOT text tokens. These are dense vectors projected from the concept space
+-- they do not have meaningful "positions" in a text sequence. Applying
+RoPE to them would inject arbitrary positional information that has no
+semantic meaning.
+
+Consider what would happen without prefix decoupling: concept token 1 would
+receive position 0's rotation, concept token 16 would receive position 15's
+rotation. The model would learn that "the first concept token is always at
+position 0" and "the sixteenth is at position 15," creating a rigid
+positional dependency. If the number of concept tokens changes (e.g., from
+16 to 32 in a future phase), these learned positional associations would
+break. Worse, the concept projector would need to account for the positional
+encoding it knows will be applied, coupling two components that should be
+independent.
+
+The solution: prefix tokens receive NO RoPE rotation. Only text tokens
+(the actual generated response) receive positional encoding, starting at
+position 0. This means:
+
+```
+Sequence:  [concept_1, concept_2, ..., concept_16, BOS, H, e, l, l, o]
+RoPE:      [none,      none,      ..., none,        0,  1, 2, 3, 4, 5]
+```
+
+The implementation handles this by splitting Q and K into prefix and text
+portions, applying RoPE only to the text portion, then re-concatenating:
+
+```rust
+if n_prefix > 0 && n_prefix < s {
+    let q_prefix = q.narrow(2, 0, n_prefix)?;
+    let q_text = q.narrow(2, n_prefix, n_text)?;
+    let q_text = apply_rope(&q_text, cos, sin)?;
+    (Tensor::cat(&[&q_prefix, &q_text], 2)?, ...)
+}
+```
+
+This decoupling is maintained in both the training forward pass and the
+cached generation path. During cached generation, the prefill step passes
+`n_prefix` so that RoPE applies only to text tokens, and subsequent
+single-token steps use `n_prefix=0` with `seq_offset` tracking the text
+position count (not the total sequence count).
+
+Note that with the cross-attention memory architecture, the prefix now
+contains only concept tokens (not memory tokens). Memory enters through
+cross-attention, which uses no RoPE at all -- memory vectors have no
+sequential position, so positional encoding would be meaningless.
+
+### Cross-Attention: Querying External Memory
+
+In addition to self-attention (where each position attends to every other
+position in the same sequence), GESTALT's decoder layers include a dedicated
+**cross-attention** mechanism for querying external memory. This is the
+architectural backbone of the memory system.
+
+#### Why Cross-Attention Instead of Prefix Concatenation?
+
+The original GESTALT design concatenated memory vectors into the prefix
+alongside concept tokens. If you had 16 concept tokens and 8 memory tokens,
+the decoder's self-attention operated over a 24-token prefix + text sequence.
+This approach has three problems:
+
+1. **Self-attention cost scales quadratically.** Adding K memory tokens to
+   a prefix increases the self-attention cost by O((K + N)^2 - N^2) = O(K^2
+   + 2KN), where N is the text length. For K=8 this is modest, but scaling
+   to K=64 or K=256 memory entries would significantly increase cost.
+
+2. **Memory competes for attention bandwidth.** In self-attention, every
+   position attends to every other position. Memory tokens must compete
+   with concept tokens and text tokens for the model's attention budget.
+   A particularly "loud" memory entry could drown out the concept signal.
+
+3. **Positional confusion.** Memory vectors have no inherent sequential
+   order. Placing them in fixed prefix positions (e.g., positions 16-23)
+   creates an artificial ordering that the model might learn to depend on.
+
+Cross-attention solves all three problems. It gives memory its own dedicated
+attention pathway, separate from the self-attention over the text sequence.
+
+#### The Architecture
+
+Cross-attention uses the same Q/K/V mechanism as self-attention, but with
+a critical difference: **Q comes from the decoder's hidden states, while
+K and V come from the external memory.**
+
+```
+Cross-attention in layer i:
+
+  Q = LayerNorm(hidden_state) @ W_q    shape: (batch, seq, d_model)
+  K = memory @ W_k                      shape: (batch, n_mem, d_model)
+  V = memory @ W_v                      shape: (batch, n_mem, d_model)
+
+  scores = Q @ K^T / sqrt(head_dim)     shape: (batch, n_heads, seq, n_mem)
+  weights = softmax(scores)              shape: (batch, n_heads, seq, n_mem)
+  output = weights @ V                   shape: (batch, n_heads, seq, head_dim)
+```
+
+Two key differences from self-attention:
+
+- **No causal mask.** Every position in the decoder can attend to every
+  memory entry. Memory is not sequential; there is no "future" to mask.
+  All memory entries are fully visible to all decoder positions.
+
+- **No RoPE.** Memory vectors are not text positions. They have no
+  sequential ordering. Applying rotary positional encoding would inject
+  meaningless position information. Cross-attention operates purely on
+  content similarity between the query (what the decoder is computing)
+  and the keys (what memory contains).
+
+#### Implementation
+
+```rust
+struct CrossAttention {
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    o_proj: Linear,
+    n_heads: usize,
+    head_dim: usize,
+}
+
+impl CrossAttention {
+    fn forward(&self, x: &Tensor, memory: &Tensor) -> Result<Tensor> {
+        let (b, s, _d) = x.dims3()?;
+        let m = memory.dim(1)?;  // number of memory entries
+
+        let q = self.q_proj.forward(x)?;          // (b, s, d)
+        let k = self.k_proj.forward(memory)?;      // (b, m, d)
+        let v = self.v_proj.forward(memory)?;      // (b, m, d)
+
+        // Reshape to multi-head, compute attention
+        let scale = (self.head_dim as f64).sqrt();
+        let attn = q.matmul(&k.transpose(...))?;   // (b, heads, s, m)
+        let attn = (attn / scale)?;
+        // No mask -- full attention to all memory entries
+        let attn = grad_softmax_last_dim(&attn)?;
+
+        let out = attn.matmul(&v)?;                // (b, heads, s, head_dim)
+        self.o_proj.forward(&out)
     }
 }
 ```
 
-All 8 integration tests pass, including this one. Memory persists.
+Each decoder layer has independent cross-attention weights (`W_q`, `W_k`,
+`W_v`, `W_o`), so different layers can learn to extract different aspects
+from memory. Layer 1 might attend to memories that match the current topic,
+while layer 4 might attend to memories that inform the response tone.
 
----
+#### Placement Within the Transformer Block
 
-## 15. Training
-
-### The Three Training Phases
-
-Training proceeds in stages, each building on the previous:
-
-```
-Phase 1: Brain SFT      (50K steps, ~90 min)    Encoder + decoder on dialogue pairs
-Phase 2: Planner SFT    (4K-40K steps, ~15 min) Plan generation on reference plans
-Phase 3: Policy          (16K steps, ~5 min)     Intent + action classification
-                                                 ─────────────
-                                           Total: ~110 min on one GPU
-```
-
-Brain SFT is the bottleneck — 50,000 steps at 2.2 steps/second on the RTX 5070 Ti. This is where the model learns to generate language.
-
-### The Optimizer: AdamW
-
-Standard transformer optimizer. Maintains two running averages per parameter:
+Cross-attention sits between self-attention and the MLP, following the
+standard encoder-decoder transformer pattern established by the original
+Transformer paper:
 
 ```
-m = 0.9 × m + 0.1 × gradient              (momentum: smoothed direction)
-v = 0.999 × v + 0.001 × gradient²          (velocity: smoothed magnitude)
-update = m / (sqrt(v) + ε)                  (direction / magnitude = normalized step)
-param -= lr × (update + wd × param)         (step + weight decay)
+input -> Self-Attention -> + residual -> Cross-Attention -> + residual -> MLP -> + residual -> output
 ```
 
-The momentum means the optimizer keeps going in a consistent direction even when individual gradients are noisy. The velocity means it adapts the step size per parameter — parameters with large, consistent gradients get smaller steps (they're already confident). Parameters with small, sporadic gradients get larger steps (they need more exploration).
+Each sub-module has its own RmsNorm and dropout. The cross-attention norm
+is separate from the self-attention norm and the MLP norm.
 
-Weight decay (wd = 0.01) prevents weights from growing too large. Without it, the model can overfit by memorizing training data with extreme weight values. Weight decay gently pulls all weights toward zero, acting as a regularizer.
+#### Graceful Degradation
 
-### Cosine Learning Rate Schedule
-
-```
-LR
- ^
- |    /‾‾‾‾\
- |   /       \
- |  /         \__________
- | /
- +----------------------------→ Steps
-   warmup  peak  cosine decay
-```
-
-**Warmup (first 10%):** LR ramps linearly from 0 to max (3e-4). Why? Because at initialization, weights are random. Random weights produce random gradients. Large random gradients with high learning rate = chaos. The warmup period lets the model find a reasonable region of parameter space before taking big steps.
-
-**Cosine decay (remaining 90%):** LR smoothly decreases following a cosine curve:
-
-```
-lr = lr_min + 0.5 × (lr_max - lr_min) × (1 + cos(π × progress))
-```
-
-This is better than linear decay because it spends more time near the peak LR (where the model learns fastest) and only slows down near the end (where fine adjustments matter).
-
-### Weighted Cross-Entropy Loss
-
-The loss measures how surprised the model is by the correct answer. For each position in the sequence:
-
-```
-loss = -log(P(correct_token))
-
-If P(correct_token) = 0.9  → loss = 0.105  (model is confident, low loss)
-If P(correct_token) = 0.01 → loss = 4.605  (model is surprised, high loss)
-```
-
-"Weighted" means different positions contribute differently to the total loss:
-- **PAD tokens**: weight 0.0 (ignore padding entirely)
-- **BOS tokens**: weight 0.0 (the start token is always the same)
-- **Content tokens**: weight 1.0 (this is what we're training on)
-- **In the planner**: STEP = 0.1, action = 1.0 (focus on the important tokens)
-
-### Early Stopping
-
-Monitors validation loss every N steps. If it hasn't improved for `patience` consecutive checks, training stops and the best checkpoint is kept.
-
-```
-Step  1000: val_loss = 3.58  → new best, save checkpoint
-Step  2000: val_loss = 2.80  → new best, save checkpoint
-Step  3000: val_loss = 2.33  → new best, save checkpoint
-Step  4000: val_loss = 2.12  → new best, save checkpoint
-Step  5000: val_loss = 2.08  → patience 1/5 (improved but barely)
-Step  6000: val_loss = 2.09  → patience 2/5 (got worse!)
-Step  7000: val_loss = 2.10  → patience 3/5
-Step  8000: val_loss = 2.11  → patience 4/5
-Step  9000: val_loss = 2.15  → patience 5/5 → STOP
-Best checkpoint: step 4000 (val_loss = 2.12)
-```
-
-This prevents overfitting — training too long causes the model to memorize training data while getting worse on new inputs. The best checkpoint from step 4000 generalizes better than the overfit model from step 9000.
-
-### Dropout (0.1): Planned Incompetence
-
-During training, randomly zeroes 10% of values in each layer. This seems counterproductive — why deliberately sabotage your model?
-
-Because it forces redundancy. Without dropout, the model can rely on a few "star" neurons to carry all the information. If those neurons get slightly wrong values, the whole output collapses. With dropout, every neuron must contribute — no single neuron is irreplaceable.
-
-The effect on training life is dramatic:
-
-```
-Without dropout: overfits at ~6K steps (v19)
-With dropout:    extends to 13K+ steps before overfitting (v20)
-```
-
-More useful training steps = more learning = better generalization.
-
-### PAD-Denoising: Forcing the Decoder to Listen
-
-This is one of our most important training tricks, born from frustration (M-029).
-
-Without noise, the decoder can predict the next byte from autoregressive context alone. If the training data says "What is love? → Love is a neurochemical...", the decoder learns the bigram statistics: after "Love is a", the next byte is probably "n." It never needs to look at the concept prefix — the local context is sufficient.
-
-The result: loss plateaus at exactly 2.15 (the bigram baseline). The encoder isn't learning because the decoder doesn't need it.
-
-The fix: replace random bytes with PAD tokens during training. PAD carries ZERO information — it's the absence of signal. When 10% of the response bytes are PAD, the decoder can't rely on local context alone. The only way to predict the missing bytes correctly is to attend to the concept prefix.
-
-```
-Without denoising:
-  Input:    [prefix] [L][o][v][e][ ][i][s][ ][a][ ][n]...
-  Model:    predicts "n" from "[a][ ]" context alone → ignores prefix
-
-With 10% PAD denoising:
-  Input:    [prefix] [L][PAD][v][e][ ][PAD][s][ ][PAD][ ][n]...
-  Model:    can't predict byte at position 1 from "[L]" alone → must attend to prefix
-```
-
-Noise schedule: quadratic ramp from 0% to 10%. Start clean so the model learns basics, then gradually corrupt to force prefix dependency.
-
----
-
-## 16. The Training Story — v2 to v23
-
-This is the most important section. It chronicles every major training run, what broke, what we learned, and how each failure led to the next breakthrough. Understanding this story is understanding how GESTALT actually works.
-
-### The Invisible Bug: v2-v12 (The Dark Ages)
-
-The first training run (v2) looked fine. Loss started at 6.3 and dropped steadily. But when we checked the encoder's output, something was wrong.
-
-We measured **concept vector similarity**: encode 50 different prompts and compute average pairwise cosine similarity. If the encoder works, different prompts should produce different vectors (similarity 0.2-0.5).
-
-Result: **0.9591**.
-
-"hello" and "what is the meaning of life" were producing essentially the same concept vector. The encoder was collapsed — every input mapped to nearly the same point in concept space.
-
-What followed was twelve experiments trying to fix this through training strategy changes:
-
-```
-v2:  Baseline SFT                    → sim = 0.9591
-v3:  Higher noise                    → sim = 0.9591
-v4:  Diversity penalty               → sim = 0.9591
-v5:  Contrastive loss                → sim = 0.9591
-v6:  Learned classifier              → sim = 0.9591
-v7:  Codebook bypass                 → sim = 0.9591
-v8:  Detached encoder                → sim = 0.9591
-v9:  Two-phase training              → sim = 0.9591
-v10: Reduced depth                   → sim = 0.9591
-v11: Different LR                    → sim = 0.9591
-v12: Encoder pre-training            → sim = 0.9591
-```
-
-Twelve experiments. Twelve identical results to four decimal places. ~4 hours of GPU time. Progressively more creative training strategies. Not a single digit of change.
-
-**That constancy was the diagnostic signal.** Different strategies, different losses, different architectures — and the metric doesn't move AT ALL. The similarity isn't "converging" to 0.96. It's stuck there from step 0. The problem isn't training. It's structural.
-
-But we didn't see it. We kept thinking "maybe v6's contrastive loss needs more weight" or "maybe v10 needs fewer layers." Classic case of looking in the wrong room for your keys — the problem was in the framework, not in our code.
-
-### The Diagnostic That Changed Everything
-
-We stopped guessing and built a test. One question: does gradient flow from the loss, through the decoder, back through the encoder?
+When no memory is available (empty memory bank, or during early training
+before memories accumulate), the cross-attention layers are simply skipped:
 
 ```rust
-#[test]
-fn test_candle_op_gradient_flow() {
-    let emb = candle_nn::embedding(10, 8, vb.pp("emb")).unwrap();
-    let norm = candle_nn::rms_norm(8, 1e-5, vb.pp("norm")).unwrap();
-
-    let hidden = emb.forward(&input).unwrap();
-    let normed = norm.forward(&hidden).unwrap();
-    let loss = normed.sqr().unwrap().mean_all().unwrap();
-    loss.backward().unwrap();
-
-    assert!(emb.weight().grad().is_some());   // FAILS — no gradient!
+if let (Some(norm), Some(ca), Some(mem)) = (&self.cross_attn_norm, &self.cross_attn, memory) {
+    let h = ca.forward(&norm.forward(&x)?, mem)?;
+    x = (x + h)?;
 }
 ```
 
-`candle_nn::RmsNorm` **disconnects the computation graph**. Every tensor that passes through it becomes a dead end for backpropagation. The gradient can't flow backward through the normalization layer.
+The `Option<&Tensor>` pattern means the model gracefully handles the
+no-memory case. The self-attention and MLP still function normally; only
+the cross-attention contribution is absent. This is important for training:
+the model learns to produce coherent responses with or without memory
+context, rather than becoming dependent on memory being present.
 
-In a transformer, RmsNorm appears **twice per layer** (before attention and before MLP) plus once at the end (final_norm). So: every gradient that needs to flow through ANY transformer layer gets stopped at the first normalization. The only parameter that receives gradients is `lm_head.weight` — the final projection from hidden states to logits — because it sits AFTER the last RmsNorm, directly connected to the loss.
+#### Configuration
 
-Same bug in `softmax_last_dim` — used in every attention computation. Even if we fixed RmsNorm, the softmax would block Q and K gradients.
-
-The encoder literally could not learn. Its 0.9591 similarity was just random initialization noise propagated through the same dead computation.
-
-### The Fix
-
-Two custom implementations using basic tensor ops:
+Cross-attention is controlled by the `use_cross_attn` field in
+`TransformerConfig`. It is enabled for the language decoder and disabled
+for the concept encoder and policy backbone:
 
 ```rust
-// GradRmsNorm — replaces candle_nn::RmsNorm
-pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-    let variance = x.sqr()?.mean_keepdim(D::Minus1)?;
-    let rms = (variance + self.eps)?.sqrt()?;
-    x.broadcast_div(&rms)?.broadcast_mul(&self.weight)
+TransformerConfig {
+    use_cross_attn: true,   // decoder: has memory to attend to
+    // ...
 }
-
-// grad_softmax_last_dim — replaces candle_nn::ops::softmax_last_dim
-let max = xs.max_keepdim(D::Minus1)?;
-let exp = xs.broadcast_sub(&max)?.exp()?;
-exp.broadcast_div(&exp.sum_keepdim(D::Minus1)?)
 ```
 
-After the fix: **all 57 trainable parameters** receive non-zero gradients. The test passes. The encoder can finally learn.
+When `use_cross_attn` is false, the `CrossAttention` struct and its
+corresponding `GradRmsNorm` are not allocated, saving both parameters and
+computation for components that do not need external memory access.
 
-**Time to find through blind experiments: 40+ hours, 12 runs.**
-**Time to find through diagnostic testing: 2 hours, 1 test.**
+### The MLP: Per-Position Transformation
 
-The lesson burned into the project's DNA: **after 2 failed experiments, STOP and build a diagnostic.** One diagnostic run reveals more than 30 blind experiments.
-
-### v14: First Light (242 pairs)
-
-With working gradients + mean pooling, the first real training run:
+After attention has gathered context from other positions, each position is
+independently transformed through a two-layer MLP (feed-forward network):
 
 ```
-SFT 25,000 steps on 242 JARVIS dialogue pairs:
-  Loss:       6.37 → 0.04 → 0.001 → 0.0000 (near-perfect)
-  Similarity: 0.96 → 0.42 → 0.28 → 0.25 (discriminative!)
-  GPU:        84-98% utilization, 13.6/16 GB VRAM, 2.2 steps/sec
-  Time:       3 hours 10 minutes
+MLP(x) = GELU(x @ W_gate + b_gate) @ W_down + b_down
 ```
 
-Greedy generation:
-```
-"hello"            → "Hello, sir. What can I do for you?"
-"What is beauty?"  → "Pattern recognition with emotional payoff."
-"good evening"     → "Evening. I take it we have work to do?"
-```
+Where:
+- `W_gate` projects from d_model (512) to d_ff (2048) -- a 4x expansion
+- `GELU` is the activation function (a smooth approximation of ReLU)
+- `W_down` projects back from d_ff (2048) to d_model (512)
 
-The encoder was finally learning. Different prompts produced genuinely different concept vectors. The JARVIS personality came through clearly. After 12 failed runs, these outputs felt miraculous.
+The 4x expansion to a larger intermediate dimension allows the MLP to
+learn more complex transformations than would be possible at the d_model
+dimension. Think of it as: attention figures out WHAT information is
+relevant, then the MLP decides WHAT TO DO with that information.
 
-**But** — this was memorization of 242 pairs. The model had ~3 concept dimensions per training example (512 dims / 242 pairs ≈ 2.1). It could store every example as a unique point in concept space and reproduce it verbatim. Novel prompts that didn't match a training example produced gibberish.
-
-### The DA Disaster (M-039)
-
-After v14's SFT success, we tried a Dialogue-Aligned (DA) fine-tuning phase. DA picks a random position in a response and trains the model to predict just that one byte given the prefix up to that point.
-
-The theory: DA should improve the model's ability to continue from any point in a sentence, not just from the beginning.
-
-The reality: DA destroyed the autoregressive flow. After 8,192 DA steps:
+GELU (Gaussian Error Linear Unit) is preferred over ReLU because it has
+a smooth gradient everywhere, which helps with training stability:
 
 ```
-Before DA:
-  "hello" → "Hello, sir. What can I do for you?"
-
-After DA:
-  "hello" → "Rello, sir. What can I do for you?"
+GELU(x) = x * Phi(x)    where Phi is the CDF of the standard normal
 ```
 
-The first byte was wrong. Longer prompts garbled after ~20 bytes. DA had taught the model to predict isolated bytes but broken the continuous flow that SFT established.
+In practice, it behaves like ReLU for large positive inputs (passes them
+through) and smoothly attenuates negative inputs (instead of hard zeroing).
 
-The fix: `da_steps = 0` by default. SFT-only is the proven path. DA needs fundamental rethinking — either much lower learning rate (1e-5 vs 1e-4), full-sequence training instead of isolated positions, or mixed SFT+DA loss.
+### Dropout: Preventing Memorization
 
-### v18: Scaling Headaches (1,749 pairs)
+During training, dropout randomly zeroes a fraction of the elements in a
+tensor. This forces the model to be robust -- it cannot rely on any single
+neuron, because that neuron might be disabled on the next training step.
 
-We built the corpus pipeline and expanded from 242 to 1,749 pairs. v18 results:
+GESTALT uses inverted dropout with rate p=0.1:
 
-```
-val_loss = 2.02 at step 2K, early-stopped at 12K
-Gallery: coherent outputs are verbatim training data, novel prompts = gibberish
-```
-
-Still memorization, but now with 1,749 memories instead of 242. The model had ~0.3 concept dimensions per example (512/1749) — not quite enough to memorize everything perfectly, so it memorized the most common patterns and garbled the rest.
-
-### v19-v20: The Vocabulary and Dropout Discoveries (21K pairs)
-
-The corpus expanded to 21,786 pairs. Now the real experiments began.
-
-**v19 (merges=2000, no dropout):** Disaster. Best val=3.55 at step 6K. Gallery: 0% coherent. The 2,259-token vocabulary was too large — each token appeared too rarely to learn a good embedding. And without dropout, the model overfit by step 6K and couldn't generalize at all.
-
-**v20 (merges=2000, dropout=0.1):** Better but not good. Best val=3.26 at step 8K. Gallery: ~30% coherent. The dropout extended useful training life from 6K to 13K+ steps. Good openings ("Hmm, let me think...") but sentences dissolved into word salad after 15 tokens.
-
-These two runs established two critical facts:
-1. **Vocabulary size matters enormously.** Too many tokens = too little training signal per token.
-2. **Dropout is essential for generalization.** Without it, the model memorizes training data and falls off a cliff when tested on novel inputs.
-
-### v22: The Breakthrough (merges=200, 30K steps)
-
-After the grid search revealed that fewer merges help, we ran the definitive Phase 2.5 experiment:
-
-```
-Config: merges=200, dropout=0.1, batch=48, 30K steps
-Corpus: 21,786 pairs, 459-token vocabulary
-Time: ~4 hours on RTX 5070 Ti
+```rust
+fn grad_dropout(x: &Tensor, p: f64, train: bool) -> Result<Tensor> {
+    if !train || p <= 0.0 {
+        return Ok(x.clone());   // no dropout during inference
+    }
+    let mask = Tensor::rand(0f32, 1f32, x.shape(), x.device())?
+        .ge(p)?                  // keep with probability (1-p)
+        .to_dtype(x.dtype())?;
+    let scale = 1.0 / (1.0 - p);
+    (x * mask * scale)?         // scale up survivors so expected value unchanged
+}
 ```
 
-The results were the best we'd ever seen:
+The scaling by `1/(1-p)` is critical: during inference, dropout is disabled,
+so all neurons are active. If we did not scale during training, the expected
+magnitude of the output would be different between training and inference,
+causing degraded generation quality.
 
-**Gallery highlights — what works (~40-45% coherent openings):**
+Dropout is applied after both the attention and MLP sub-layers. It is only
+active during training; during inference (generation), it is a no-op.
 
-```
-"good morning"
-  → "Morning! How'd you sleep?"
-    ✓ Perfect. Natural, conversational, in-character.
+**The dropout discovery:** Training run v19 (no dropout) began overfitting
+at step 6,000. Adding dropout=0.1 in v20 extended useful training to step
+13,000+, a 2x improvement in training life before overfitting. This single
+change improved coherence from 0% to ~30%.
 
-"The build broke and I don't know why"
-  → "Step one: read the error message. The whole thing, not just the last line."
-    ✓ Excellent. Practical, specific, personality intact.
+### The Full Transformer Stack
 
-"tell me about yourself"
-  → "I'm a language model with opinions, a dry sense of humor, and a generator
-     conversation."
-    ✓ Strong opening. JARVIS voice captured. Degrades after ~15 tokens.
+A complete `WiredTransformer` consists of:
 
-"What do you think about Neon Genesis Evangelion?"
-  → "A mecha show that's actually about depression, parental abandonment, and the
-     hedgehog's dilemma..."
-    ✓ Remarkable. Captured the actual critical analysis of NGE.
+1. **Token embedding:** a lookup table mapping token IDs to d_model vectors
+2. **N transformer blocks:** stacked attention + MLP layers
+3. **Final RmsNorm:** normalizes the output of the last block
+4. **LM head:** a linear projection from d_model to vocab_size (logits)
+5. **Precomputed RoPE tables:** cos and sin for all positions
+6. **Precomputed causal mask:** for the maximum sequence length
 
-"I'm scared of failing"
-  → "Good. Fear of failure means you care about the..."
-    ✓ Emotionally intelligent opening.
-
-"debug this function"
-  → "First, read the error. Then isolate the..."
-    ✓ JARVIS debugging methodology.
-```
-
-**What breaks — the ~15 token wall:**
-
-After ~15 tokens, outputs degenerate into word salad. The model interpolates between training examples mid-sentence:
-
-```
-"what is a transformer"
-  → "A novel that's referring to the computer science. We can be seen as a bad linear
-     fast and it's insurance to former."
-
-"What is beauty?"
-  → "Hmm, let me think... it's when something hits are the bad. It's the decision
-     notice, but fear - that's rightly proved that ating with line is just
-     optimization..."
+```rust
+pub struct WiredTransformer {
+    tok_emb: Embedding,              // token ID -> vector
+    layers: Vec<TransformerBlock>,    // N stacked blocks (with optional cross-attn)
+    final_norm: GradRmsNorm,         // output normalization
+    lm_head: Linear,                 // hidden state -> vocab logits
+    rope_cos: Tensor,                // precomputed cos table (YaRN-aware)
+    rope_sin: Tensor,                // precomputed sin table (YaRN-aware)
+    causal_mask: Tensor,             // precomputed causal mask
+    attn_temp: f32,                  // YaRN attention temperature (1.0 at train length)
+}
 ```
 
-**The pattern**: First ~10-15 tokens are often correct and stylistically on-point. After that, the model runs out of "memorized opening" and starts interpolating between training examples. Common words and phrases from different dialogues get mixed together into semantic soup.
+The `attn_temp` field stores the YaRN attention temperature factor. It is
+computed once at model initialization: 1.0 when `max_seq_len <= max_train_len`
+(normal training), or `sqrt(max_seq_len / max_train_len)` when the model
+is being used for sequences longer than its training window.
 
-This is the **capacity bottleneck**. A 512-dimensional model with 21K pairs learns openings — the first few tokens of common response patterns — but doesn't have enough capacity to model full response sequences. It generalizes greeting patterns but not paragraph structure.
+The same `WiredTransformer` struct is used for the concept encoder, the
+language decoder, the planner, and the policy backbone -- only the
+configuration (dimensions, layer count, vocab size, cross-attention) differs.
 
-### v23: The Corpus Quality Lesson (92K pairs)
+### KV Cache: O(1) Generation
 
-Thinking "more data = better model," we expanded to 92K pairs (SlimOrca, UltraChat, WizardLM). The result was humbling.
+During autoregressive generation (producing text one token at a time), the
+naive approach recomputes attention over the entire sequence for each new
+token. For a sequence of length N, generating T tokens requires O(N*T)
+attention computations -- and N grows with each token generated.
 
-**v23 at 11K steps, val_loss=1.88 (better than v22's 1.9):**
+The KV cache eliminates this quadratic cost. The insight: when generating
+token at position T, the Key and Value projections for all positions
+0..T-1 are identical to what they were when we generated position T-1.
+Only the new token's K and V are new.
+
+GESTALT stores the K and V tensors from each layer after each generation
+step. On the next step, only the new token is processed through Q/K/V
+projection, and its K/V are concatenated with the cached values:
+
+```rust
+fn forward_cached(&self, x: &Tensor, ..., kv_cache: &mut Option<(Tensor, Tensor)>) {
+    let q = self.q_proj.forward(x)?;   // only new token(s)
+    let k = self.k_proj.forward(x)?;
+    let v = self.v_proj.forward(x)?;
+
+    // Concat with cached K/V
+    let (k, v) = if let Some((past_k, past_v)) = kv_cache.take() {
+        (Tensor::cat(&[&past_k, &k], 2)?,
+         Tensor::cat(&[&past_v, &v], 2)?)
+    } else {
+        (k, v)
+    };
+    *kv_cache = Some((k.clone(), v.clone()));
+
+    // Attention: new Q against all K, gather from all V
+    let attn = q.matmul(&k.transpose(...))?;
+    // ...
+}
 ```
-"hello" → "I'm not explaining what you want to do that?"
-"good morning" → (long ramble about surfaces and codes)
-"what is a transformer" → "A low-free problem is a constant system..."
+
+The generation loop has two phases:
+
+1. **Prefill:** Process the entire prompt (prefix + BOS) in one forward pass,
+   populating the KV cache. This is O(N^2) but only happens once.
+
+2. **Step:** For each new token, process only that single token, attending
+   to the cached K/V from all previous positions. This is O(N) per token
+   instead of O(N^2).
+
+For generating a 200-token response with a 16-token prefix, the naive
+approach would require ~50,000 attention operations (quadratic). With KV
+cache, it requires ~16*200 + 200*200/2 = ~23,200 (roughly 2x speedup,
+and the constant factor is much smaller because each step processes only
+1 token through the transformer layers instead of the full sequence).
+
+#### Causal Mask Simplification for Cached Steps
+
+The causal mask during cached generation is simpler than during training.
+During prefill, a standard causal mask is used (position `i` attends to
+positions `0..=i`). But during single-token step calls, the new token is
+always the latest in the sequence -- it should attend to everything in the
+cache. So the mask is simply all zeros:
+
+```rust
+let mask = if s == 1 {
+    // Single-token step: attend to all cached entries
+    Tensor::zeros((1, 1, 1, kv_len), DType::F32, device)?
+} else {
+    // Prefill: standard causal mask
+    // ...
+};
 ```
 
-Grammatically improved. Semantically destroyed. The model had learned to generate fluent generic-AI-assistant text instead of JARVIS personality. Lower loss, worse output.
+This optimization avoids constructing and applying a mask tensor for the
+common case (step calls), and is correct because the KV cache only ever
+contains entries from the past -- there is no "future" to mask.
 
-**Key insight: val_loss measures prediction accuracy on the TRAINING distribution, not response quality.** A model that perfectly predicts generic AI responses will have low loss on a corpus full of generic AI text — but it won't sound like JARVIS.
+#### Memory Threading Through Cached Generation
 
-**Corpus quality > corpus quantity.** 21K pairs with personality > 92K pairs with committee voice. The next expansion will be quality-filtered.
+The KV cache path threads external memory through every layer of the
+decoder. Both `forward_with_prefix_cached` (prefill) and
+`forward_step_cached` (per-token steps) accept an optional `memory`
+parameter:
 
-### Training Run Summary
+```rust
+pub fn forward_with_prefix_cached(
+    &self,
+    prefix: &Tensor,
+    input_ids: &Tensor,
+    kv_caches: &mut Vec<Option<(Tensor, Tensor)>>,
+    memory: Option<&Tensor>,    // cross-attention K/V source
+) -> Result<Tensor> { ... }
 
-| Run | Corpus | Vocab | Dropout | Steps | Best Val | Gallery |
-|-----|--------|-------|---------|-------|----------|---------|
-| v2-v12 | 242 | 259 (bytes) | 0.0 | varies | N/A | Encoder dead (M-032) |
-| v14 | 242 | 259 (bytes) | 0.0 | 25K | ~0.00 | Perfect memorization |
-| v18 | 1,749 | 259 (bytes) | 0.0 | 12K | 2.02 | Memorized verbatim |
-| v19 | 21,786 | 2,259 | 0.0 | 6K | 3.55 | 0% coherent |
-| v20 | 21,786 | 2,259 | 0.1 | 8K | 3.26 | ~30% coherent |
-| v22 mock | 21,786 | 459 | 0.1 | 5K | 2.04 | Grammar good, semantics weak |
-| **v22 hero** | **21,786** | **459** | **0.1** | **30K** | **~1.9** | **~40-45% coherent openings** |
-| v23 (11K) | 92,273 | 459 | 0.1 | 11K | 1.88 | Fluent but personality-flat |
+pub fn forward_step_cached(
+    &self,
+    token_id: &Tensor,
+    seq_offset: usize,
+    kv_caches: &mut Vec<Option<(Tensor, Tensor)>>,
+    memory: Option<&Tensor>,    // same memory for every step
+) -> Result<Tensor> { ... }
+```
+
+The same projected memory tensor is passed to every generation step. This
+is efficient because memory does not change during generation -- it was
+retrieved once from the memory bank before generation started. The cross-
+attention K/V projections for memory could theoretically be cached too
+(since memory is constant), but this optimization is not yet implemented.
+
+Note that the KV cache only stores self-attention K/V tensors. Cross-
+attention has no cache because it re-computes Q (from the evolving hidden
+state) against the same memory K/V at every layer and step.
+
+### Cross-Entropy Loss
+
+Training a language model means making the model's predicted probability
+distribution match the actual next token. This is measured by cross-entropy
+loss.
+
+For a single position where the model predicts logits `z` (raw scores before
+softmax) and the correct token is class `c`:
+
+```
+loss = -log(softmax(z)[c])
+     = -z[c] + log(sum(exp(z[j]) for all j))
+```
+
+This has a nice interpretation: the loss is low when the model assigns high
+probability to the correct token, and high when it assigns low probability.
+The minimum possible loss is 0 (the model is 100% confident in the correct
+answer).
+
+For a full sequence, the loss is averaged over all positions:
+
+```rust
+pub fn cross_entropy_loss(logits: &Tensor, targets: &Tensor) -> Result<Tensor> {
+    let (b, s, v) = logits.dims3()?;
+    let logits_flat = logits.reshape((b * s, v))?;
+    let targets_flat = targets.reshape(b * s)?;
+    candle_nn::loss::cross_entropy(&logits_flat, &targets_flat)
+}
+```
+
+### Gradient Verification
+
+Given the candle-nn bugs described above, GESTALT includes a built-in
+numerical gradient checker. This computes gradients two ways and compares:
+
+1. **Autograd:** The standard backward pass through the computation graph
+2. **Numerical:** Perturb each parameter by +epsilon and -epsilon, measure
+   the loss change, compute (loss+ - loss-) / (2*epsilon)
+
+If the relative error between these two exceeds a threshold, something is
+wrong with the backward pass. After installing `GradRmsNorm` and
+`grad_softmax_last_dim`, the maximum relative error dropped below 0.04 --
+confirming that gradient flow is now correct through the entire model.
 
 ---
 
-## 17. The Full Pipeline — A Complete Walkthrough
+## 5. The Brain -- Where Everything Meets
 
-Let's trace exactly what happens when you type a goal into GESTALT. Not the theory — the actual tensor operations, function calls, and data transformations. This is how the system works right now, today.
+The `Brain` struct is the top-level neural network that owns all components
+and orchestrates their interaction. It is the central data structure of
+GESTALT.
 
-### Step 1: You Type a Goal
-
-```
-"search for the GPU policy code and then open it"
-```
-
-This is a UTF-8 string. 49 bytes. The pipeline receives it as a `&str` in Rust.
-
-### Step 2: Tokenization
-
-The ConceptTokenizer converts the string into token IDs. With 200 BPE merges (459 tokens total), common byte sequences are merged:
+### Components
 
 ```rust
-let tokens = tokenizer.encode("search for the GPU policy code and then open it");
-// Result: [342, 115, 101, 97, 114, 99, 104, ...]  (12 tokens instead of 49 bytes)
-// Compression ratio: 49/12 = 4.08x
+pub struct Brain {
+    // --- Language Pipeline ---
+    concept_encoder: WiredTransformer,    // goal -> concept_vec (no cross-attn)
+    concept_projector: Linear,            // concept_vec -> 16 prefix embeddings
+    memory_projector: Linear,             // memory vec -> cross-attn K/V input
+    language_decoder: WiredTransformer,   // prefix + tokens -> next token logits
+                                          // (with cross-attn for memory)
+    memory_bank: MemoryBank,              // in-memory episodic store
+
+    // --- Policy Pipeline ---
+    policy_backbone: WiredTransformer,    // goal bytes -> hidden states (no cross-attn)
+    head_intent: Linear,                  // hidden -> 16 intent classes
+    head_actions: Linear,                 // hidden -> 6*16 action logits
+    head_patterns: Linear,               // hidden -> 6*6 pattern logits
+    head_files: Linear,                  // hidden -> 6*10 file logits
+    head_picks: Linear,                  // hidden -> 6*129 argument logits
+}
 ```
 
-Each token ID indexes into a 512-dimensional embedding table. The special tokens PAD (0), BOS (1), and EOS (2) are reserved. The embedding table is learned during training — each token gets a unique 512-dimensional vector that encodes its meaning and relationships.
+The Brain has two largely independent pipelines that share the concept
+vector: the **language pipeline** (for generating natural language
+responses) and the **policy pipeline** (for choosing actions and tools).
+Only the language decoder has cross-attention enabled (for memory access).
+The concept encoder and policy backbone use standard self-attention only.
 
-### Step 3: Encoding
+### The Concept Encoder
 
-The token embeddings pass through the ConceptEncoder — a 1-layer transformer with 8 attention heads:
+The concept encoder takes tokenized input and produces a single concept
+vector that summarizes the meaning of the entire input.
 
-```
-Token embeddings:     (1, 12, 512)     — 12 tokens, each 512-dim
-    ↓ Self-attention (8 heads, RoPE positional encoding)
-    ↓ RMSNorm + residual connection
-    ↓ Feed-forward MLP (512 → 2048 → 512)
-    ↓ RMSNorm + residual connection
-Contextualized:       (1, 12, 512)     — 12 tokens, now context-aware
-    ↓ Mean pool across non-PAD positions
-Concept vector:       (1, 512)          — THE bottleneck
-```
+**Architecture:** A 1-layer WiredTransformer with TALK_VOCAB_SIZE=259
+(256 bytes + PAD + BOS + EOS). The shallow depth is deliberate: deeper
+encoders (4 layers) showed "depth-induced collapse" at initialization,
+where all inputs produced nearly identical concept vectors (cosine
+similarity 0.96). A single layer provides enough representational power
+for the compression task without this pathological initialization behavior.
 
-That 512-dimensional vector IS the meaning of "search for the GPU policy code and then open it." Similar goals produce similar vectors. Different goals produce different vectors. Cosine similarity between "hello" and "search for code" is ~0.25 — genuinely different representations.
-
-### Step 4: Projection
-
-The ConceptProjector expands the 512-dim vector into 16 prefix tokens for the decoder:
-
-```
-Concept vector:       (1, 512)          — compressed meaning
-    ↓ Linear layer (512 → 8192)
-    ↓ Reshape
-Prefix tokens:        (1, 16, 512)      — 16 "concept tokens"
-```
-
-These prefix tokens serve as the context for everything downstream — the decoder reads them to understand what it should say, the policy heads read the concept vector to decide what to do.
-
-### Step 5: Policy Classification
-
-Five linear heads classify the goal simultaneously:
-
-```
-Concept vector → Intent head    → Composite (idx 10, confidence 0.94)
-Concept vector → Action head    → [rg, repo_read, END, PAD, PAD, PAD]
-Concept vector → Pattern head   → [PAT1, -, -, -, -, -]
-Concept vector → File head      → [-, FILE0, -, -, -, -]
-Concept vector → Pick head      → [PICK0, -, -, -, -, -]
-```
-
-Five decisions from one forward pass. ~1ms on GPU.
-
-### Step 6: Plan Generation
-
-The FSM-constrained planner generates an executable plan:
-
-```
-Input: goal tokens + PLAN_SEP
-FSM state: Start → only STEP is legal
-    ↓ Decoder predicts STEP (forced)
-FSM state: AfterStep → only action tokens legal
-    ↓ Decoder predicts RG (model's choice, from distribution)
-FSM state: AfterAction(rg) → rg needs a pattern argument
-    ↓ Decoder predicts PAT1
-FSM state: Complete → STEP or EOP legal
-    ↓ Decoder predicts STEP
-    ↓ Decoder predicts REPOREAD
-    ↓ Decoder predicts FILE0
-    ↓ Decoder predicts EOP
-
-Plan: [STEP, RG, PAT1, STEP, REPOREAD, FILE0, EOP]
-```
-
-Every token in this plan was chosen by the model's probability distribution, but the FSM ensured that only syntactically legal tokens could be selected. The plan ALWAYS parses. Always.
-
-### Step 7: Plan Compilation
-
-The plan tokens are compiled into executable ToolSteps:
+**Mean Pooling:** After the transformer produces hidden states for each
+position, the concept vector is computed by averaging over all non-PAD
+positions:
 
 ```rust
-let steps = compile_plan(&plan_tokens);
-// Result:
-// Step 0: ToolStep { tool: Rg, args: { pattern: "GPU policy" } }
-// Step 1: ToolStep { tool: RepoRead, args: { file: step0.result.first_match } }
+pub fn encode_concept(&self, goal_ids: &Tensor) -> Result<Tensor> {
+    let hidden = self.concept_encoder.encode(goal_ids)?;    // (B, S, d_model)
+
+    // Build mask: 1 for real tokens, 0 for PAD
+    let pad_val = Tensor::new(&[TOK_PAD], goal_ids.device())?;
+    let is_pad = goal_ids.broadcast_eq(&pad_val)?;
+    let mask = is_pad.to_dtype(DType::F32)?.neg()?.affine(1.0, 1.0)?;
+
+    // Masked mean
+    let mask_3d = mask.unsqueeze(2)?;                       // (B, S, 1)
+    let masked_hidden = hidden.broadcast_mul(&mask_3d)?;
+    let sum = masked_hidden.sum(1)?;                        // (B, d_model)
+    let count = mask.sum(1)?.unsqueeze(1)?.clamp(1.0, f64::MAX)?;
+    sum.broadcast_div(&count)
+}
 ```
 
-Step 1 references step 0's output — it will read whatever file ripgrep found. This chaining is automatic.
+Mean pooling was chosen over the common alternative of using the last
+token's hidden state. The reason: with left-padded input, the last token
+is always EOS at the same position. All inputs ended with the same token
+at the same position, so last-token pooling produced nearly identical
+vectors for every input. Mean pooling aggregates information from all
+real tokens, producing properly discriminative vectors.
 
-### Step 8: Tool Execution
+### The Concept Projector
 
-Each step spawns a real subprocess:
+The concept vector is a single 512-dimensional vector. The language decoder
+expects a sequence of embedding vectors as input (to serve as a "prompt"
+for generation). The concept projector bridges this gap:
 
 ```
-Step 0: Rg
-    spawn: rg "GPU policy" ./src --json
-    timeout: 30 seconds
-    safety: ReadOnly
-    stdout: "src/policy.rs:42: fn gpu_policy() {"
-    exit_code: 0 ✓
-
-Step 1: RepoRead
-    spawn: cat src/policy.rs | head -100
-    timeout: 30 seconds
-    safety: ReadOnly
-    stdout: (file contents, ~2KB)
-    exit_code: 0 ✓
+concept_vec: (batch, 512)
+    |
+    v
+Linear(512, 16*512 = 8192)
+    |
+    v
+reshape: (batch, 16, 512)    -- 16 prefix embedding vectors
 ```
 
-Real processes. Real files. Real output. Not a simulation.
+Each of these 16 vectors becomes a "concept token" that the decoder can
+attend to. Think of it as the model explaining the concept to itself in
+16 different ways, giving the decoder rich access to the encoded meaning.
 
-### Step 9: Memory Storage
+The number 16 was chosen as a balance: fewer tokens lose too much
+information from the bottleneck; more tokens dilute the signal and
+increase computation. In practice, the decoder produces coherent responses
+conditioned on these 16 prefix tokens, confirming that the bottleneck
+preserves enough information.
 
-The experience is stored for future retrieval:
+### The Memory Projector
+
+When previous interactions are retrieved from the memory bank, their
+concept vectors are projected through a separate linear layer before
+being passed to the decoder's cross-attention:
+
+```
+memory_vecs: (batch, K, 512)     K retrieved memory concept vectors
+    |
+    v
+Linear(512, 512)                  per-vector projection
+    |
+    v
+projected_mem: (batch, K, 512)   K projected memory vectors
+    |
+    v
+[passed to cross-attention as K/V source in every decoder layer]
+```
+
+In the original design, memory was concatenated into the prefix alongside
+concept tokens. The current architecture separates these two pathways:
+
+- **Concept prefix** enters through self-attention (prepended to text tokens)
+- **Memory** enters through cross-attention (separate K/V pathway per layer)
+
+This separation means the self-attention prefix is smaller (16 tokens for
+concepts only, not 24), and memory gets dedicated attention weights that
+can specialize in memory retrieval rather than sharing bandwidth with
+text generation.
+
+### The Language Decoder
+
+The language decoder is a 4-layer WiredTransformer with cross-attention
+enabled that generates text one token at a time. It is conditioned on the
+concept prefix (through self-attention) and optionally on external memory
+(through cross-attention). It uses the same base architecture as the
+encoder but with more layers, a causal attention mask, cross-attention
+layers, and YaRN-aware RoPE.
+
+**Forward pass with prefix and memory:**
 
 ```rust
-brain.memory.store(
-    concept_vec,                    // 512 floats → 2,048 bytes
-    "search for GPU policy code",   // the goal
-    "Found in src/policy.rs:42",    // the response
-    true,                           // success
+pub fn forward_with_prefix_t(
+    &self, prefix: &Tensor, input_ids: &Tensor, train: bool, memory: Option<&Tensor>
+) {
+    let tok_embs = self.tok_emb.forward(input_ids)?;  // embed tokens
+    let x = Tensor::cat(&[prefix, &tok_embs], 1)?;     // prepend concept prefix
+    let n_prefix = prefix.dim(1)?;
+
+    for layer in &self.layers {
+        x = layer.forward(
+            &x, cos, sin, causal_mask, train, n_prefix, self.attn_temp, memory
+        )?;
+    }
+    x = self.final_norm.forward(&x)?;
+
+    // Return logits only for token positions (not prefix positions)
+    let token_hidden = x.narrow(1, n_prefix, seq_len)?;
+    self.lm_head.forward(&token_hidden)
+}
+```
+
+Key details:
+
+- **Logits are only computed for token positions**, not prefix positions.
+  The prefix serves as conditioning context; we do not need to predict
+  what comes after a concept token.
+
+- **`memory` is passed to every layer's cross-attention.** If memory is
+  `None` (no memories available), the cross-attention sub-layer is skipped
+  and the block behaves like a standard self-attention + MLP block.
+
+- **`n_prefix` is threaded to every layer** for RoPE prefix decoupling.
+  Prefix tokens get no positional encoding; text tokens start at position 0.
+
+- **`attn_temp` is threaded to every layer** for YaRN attention temperature
+  compensation when processing sequences longer than the training window.
+
+### The Generation Loop
+
+At inference time, the decoder generates text autoregressively -- one
+token at a time, using the KV cache for efficiency and cross-attention
+for memory access.
+
+```
+1. ENCODE: goal -> concept_vec
+2. BUILD PREFIX: concept_vec -> (1, 16, 512)     [concept only, no memory]
+3. PROJECT MEMORY: retrieve top-K memories -> project -> (1, K, 512)
+4. PREFILL: [prefix + BOS] through decoder with memory cross-attn, cache K/V
+5. SAMPLE first token from logits
+6. LOOP:
+   a. Process new token through decoder (single-token step, cached, with memory)
+   b. Get logits for next position
+   c. Apply sampling: temperature -> top-k -> top-p -> n-gram penalty
+   d. Sample next token
+   e. If EOS, stop
+7. DECODE: token IDs -> text via ConceptTokenizer
+```
+
+The memory tensor is projected once (step 3) and passed to every decoder
+call (steps 4 and 6a). It does not enter the prefix or the KV cache --
+it is a constant external input to cross-attention at every layer.
+
+#### Sampling Strategy
+
+Raw model logits are transformed through several sampling stages:
+
+**Temperature scaling:** Divide logits by temperature T before softmax.
+T < 1 makes the distribution sharper (more deterministic), T > 1 makes it
+flatter (more random). Default T=0.8.
+
+```
+scaled_logit = logit / temperature
+```
+
+**Top-K filtering:** Zero out all logits except the K highest. Default K=40.
+This prevents sampling from the long tail of unlikely tokens.
+
+**Top-P (nucleus) sampling:** After top-K, sort remaining tokens by
+probability and include only enough to cover probability mass P. Default
+P=0.9. This adapts the number of candidates: for confident positions
+(one dominant token), very few candidates; for uncertain positions, more.
+
+**N-gram repetition penalty:** Penalize any token that would create a
+repeated N-gram (default N=4, penalty=2.0). This is specifically designed
+for byte-level and sub-word vocabularies where individual tokens naturally
+repeat (the letter 'e' appears many times in any English text). A naive
+token-level repetition penalty (as used in GPT-2) would destroy coherent
+output at this tokenization granularity, because it penalizes every
+repeated byte. The N-gram approach only penalizes actual repetitive
+sequences like "light-light-light."
+
+**Critical ordering:** Temperature must be applied FIRST, because it changes
+the probability distribution shape that subsequent filters (top-K, top-P)
+operate on. Applying top-P at T=1.0 and then sampling at T=0.5 produces
+a different (worse) nucleus than applying temperature first.
+
+### Byte-Level Tokenization
+
+The encoder side uses a `TalkTokenizer` that operates at the byte level:
+each byte of UTF-8 text becomes one token. Special tokens: PAD=256,
+BOS=257, EOS=258. Total vocab: 259.
+
+```
+"hello" -> [BOS, 104, 101, 108, 108, 111, EOS]
+         = [257, 'h', 'e',  'l', 'l',  'o', 258]
+```
+
+The encoder always uses byte-level tokenization. The decoder can use either
+byte-level or concept-level tokenization (with BPE merges), depending on
+the ConceptTokenizer configuration. More on this in Section 6.
+
+---
+
+## 6. The Tokenizer -- From Bytes to Meaning
+
+GESTALT has three tokenizers, each serving a different purpose:
+
+### TalkTokenizer (Byte-Level)
+
+The simplest possible tokenizer: each byte of UTF-8 text becomes one token.
+Three special tokens bring the vocab to 259.
+
+- **PAD (256):** padding for fixed-length sequences
+- **BOS (257):** beginning of sequence
+- **EOS (258):** end of sequence
+
+This is used by the concept encoder (always) and the language decoder
+(when no concept merges are active).
+
+**Advantage:** Zero information loss. Every possible text is representable.
+**Disadvantage:** Long sequences. "Hello, world!" is 13 tokens. A 200-word
+response might be 1,200 tokens, exceeding the decoder's 256-position
+sequence length.
+
+### ConceptTokenizer (BPE with Concept-Space Discovery)
+
+To address the sequence length problem, GESTALT learns to compress frequent
+byte patterns into single tokens. This is a variant of Byte Pair Encoding
+(BPE), but with a twist: instead of merging purely by statistical frequency,
+the merges are designed to capture patterns that are semantically meaningful
+to the concept encoder.
+
+**Base vocabulary:** The same 259 tokens as TalkTokenizer (256 bytes + PAD
++ BOS + EOS).
+
+**Merge tokens:** Additional tokens starting at ID 259, each representing a
+common byte pattern. With 200 merges, the total vocabulary is 459 tokens.
+
+#### How Merges Are Discovered
+
+```
+1. SCAN CORPUS
+   For each text in the corpus, extract all byte n-grams (length 2-8).
+   Count the frequency of each unique n-gram.
+
+2. SCORE
+   For each n-gram with frequency >= min_frequency:
+     score = frequency * (pattern_length - 1)
+   The (length - 1) factor measures compression: a 4-byte pattern merged
+   into 1 token saves 3 tokens per occurrence.
+
+3. RANK AND SELECT
+   Sort by score descending. Take the top max_merges patterns.
+   Assign token IDs starting at 259.
+```
+
+Example merges discovered from the JARVIS dialogue corpus:
+
+| Rank | Pattern | Score | Token ID |
+|------|---------|-------|----------|
+| 1    | " the " | 14,280 | 259 |
+| 2    | "ing "  | 11,847 | 260 |
+| 3    | " I "   | 10,521 | 261 |
+| 4    | "tion"  | 9,836  | 262 |
+| 5    | " you " | 8,744  | 263 |
+
+The top merges are common English function words and suffixes -- exactly
+the patterns that appear most frequently and benefit most from compression.
+
+#### Encoding with Merges
+
+Encoding uses greedy longest-match. Merges are sorted by pattern length
+descending:
+
+```rust
+pub fn encode(&self, s: &str) -> Vec<u32> {
+    let mut ids = vec![CONCEPT_TOK_BOS];
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let mut matched = false;
+        for rule in &self.merges {      // sorted longest first
+            if bytes[i..].starts_with(&rule.pattern) {
+                ids.push(rule.token_id);
+                i += rule.pattern.len();
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            ids.push(bytes[i] as u32);  // fallback to raw byte
+            i += 1;
+        }
+    }
+    ids.push(CONCEPT_TOK_EOS);
+    ids
+}
+```
+
+**Lossless:** If a byte pattern has no matching merge, it falls back to
+the raw byte. This means every possible input can be encoded, even if it
+contains patterns never seen in the training corpus.
+
+#### The Sweet Spot: 200 Merges
+
+Extensive grid search revealed a clear sweet spot:
+
+| Merges | Vocab Size | Compression | Val Loss @ 300 steps |
+|--------|-----------|-------------|---------------------|
+| 50     | 309       | ~1.3x       | 2.79                |
+| 100    | 359       | ~1.5x       | 3.13                |
+| **200**| **459**   | **~2.0x**   | **3.56**            |
+| 500    | 759       | ~2.5x       | 4.08                |
+| 1000   | 1259      | ~3.0x       | 4.70                |
+| 2000   | 2259      | ~4.0x       | 5.53                |
+
+The relationship is clear: fewer merges = faster convergence. At 200
+merges, the vocabulary is small enough for the model to learn each token's
+meaning quickly, while achieving ~2x compression (halving sequence lengths).
+
+Below 150 merges, compression approaches byte-level (diminishing returns).
+Above 500 merges, the model struggles to learn the meaning of so many
+tokens with limited training data.
+
+The curve flattens between 180-220 merges -- there is a natural knee
+where additional merges provide less incremental compression.
+
+#### Concept-Aware Merges (Future)
+
+The current merge discovery uses frequency times compression as the score.
+The original design intention was to score merges by *concept-space
+consistency*: compute the concept vector for each occurrence of a byte
+pattern, then measure how similar those vectors are. Patterns that always
+mean the same thing (high consistency) would be preferred over patterns
+that appear in varied contexts (low consistency).
+
+This is currently disabled because the context-free encoding makes every
+occurrence produce the same vector (consistency = 1.0 for everything).
+When context-aware encoding is added in a future phase, the concept_fn
+parameter will be re-enabled and merge discovery will become semantically
+guided rather than purely statistical.
+
+### PlanTokenizer (Structured Plan Vocabulary)
+
+The planner uses a completely different tokenizer with a fixed 373-token
+vocabulary designed for structured tool plans:
+
+- **Structural tokens:** PAD, BOS, UNK, newline, EOP, STEP, Goal, Plan
+- **Action tokens (15):** TALK, CARGOTEST, FIXTESTS, RG, REPOREAD, etc.
+- **Parameter tokens:** PAT0-PAT5, FILE0-FILE9, PICK0-PICK128, FROM0-FROM7
+- **Character tokens:** ASCII 32-126 (for inline text arguments)
+- **Word tokens:** common words (hello, test, search, file, etc.)
+- **Extended tokens:** TEXT/ENDTEXT, THINK/ENDTHINK, BECAUSE, THEN, etc.
+
+This vocabulary is entirely static -- no learning, no merges. It exists to
+give the FSM-constrained decoder a clean, finite set of symbols to work with.
+
+---
+
+## 7. The Memory System -- Episodic Recall
+
+GESTALT has two memory systems: an in-memory bank for fast access during
+a session, and a SQLite-backed persistent store that survives restarts.
+
+### In-Memory MemoryBank
+
+The `MemoryBank` in brain.rs provides fast, in-process memory:
+
+```rust
+struct MemoryEntry {
+    concept_vec: Vec<f32>,    // 512-dimensional concept vector
+    response: String,          // the generated response text
+}
+
+pub struct MemoryBank {
+    entries: Vec<MemoryEntry>,
+    capacity: usize,           // default: 1024
+}
+```
+
+**Storage:** When the brain processes a dialogue, the concept vector and
+response are stored as a new entry. If the bank is at capacity, the oldest
+entry is removed (FIFO eviction).
+
+**Retrieval:** Given a query concept vector, find the K most similar stored
+vectors by cosine similarity:
+
+```
+cosine_sim(a, b) = dot(a, b) / (||a|| * ||b||)
+```
+
+Where `dot(a, b) = sum(a_i * b_i)` and `||a|| = sqrt(sum(a_i^2))`.
+
+The top-K vectors are returned for projection and use as cross-attention
+K/V inputs to the decoder. Default K=8.
+
+**Why cosine similarity?** The concept encoder produces vectors of varying
+magnitudes. Cosine similarity measures directional similarity, ignoring
+magnitude. Two concepts that "point in the same direction" in the 512-
+dimensional space are semantically similar, regardless of their vector
+lengths.
+
+### Persistent EpisodicMemory (SQLite)
+
+The `EpisodicMemory` in memory.rs provides disk-backed persistence:
+
+```sql
+CREATE TABLE episodes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+    concept_vec BLOB NOT NULL,
+    goal TEXT NOT NULL,
+    response TEXT NOT NULL,
+    success INTEGER NOT NULL DEFAULT 1
 );
 ```
 
-Next time someone asks about GPU policy, this memory will be retrieved via cosine similarity and injected as prefix context for the decoder.
+**Concept vectors as BLOBs:** The 512-dimensional f32 vector is stored as
+raw bytes (512 * 4 = 2,048 bytes per entry). Conversion:
 
-### Step 10: Response Generation
+```rust
+fn vec_to_blob(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
 
-If the intent is conversational, the decoder generates a response:
-
-```
-Decoder input:
-  [concept_prefix (16 tokens)][memory_prefix (0-8 tokens)][BOS]
-
-Step 1: predict "F"    (from prefix context: this was a search task)
-Step 2: predict "o"
-Step 3: predict "un"   (merged token)
-Step 4: predict "d"
-...
-Step N: predict EOS
-
-Response: "Found the GPU policy in src/policy.rs, line 42."
+fn blob_to_vec(blob: &[u8]) -> Vec<f32> {
+    blob.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
 ```
 
-The entire pipeline — tokenization, encoding, classification, planning, execution, memory, generation — runs in under 2 seconds. The neural network parts take ~50ms. The subprocess execution takes the rest.
+**Retrieval:** Same cosine similarity approach as the in-memory bank, but
+loads all entries from SQLite first. This is O(N) in the number of stored
+episodes -- acceptable for the current capacity (1024 entries), but would
+need an approximate nearest neighbor index for larger scales.
+
+**Consolidation:** Over time, the memory accumulates similar entries (e.g.,
+many greetings that produce near-identical concept vectors). The
+`consolidate()` method merges these:
+
+```
+For each pair of entries (i, j) where i < j:
+    if cosine_sim(concept_vec_i, concept_vec_j) > threshold:
+        delete the older entry (i)
+        keep the newer entry (j)
+```
+
+This reduces storage without losing coverage of distinct concepts.
+
+### How Memories Reach the Decoder
+
+During generation, the memory retrieval and projection pipeline works as:
+
+```
+1. Encode the current goal into a concept_vec
+2. Query the memory bank: top-K by cosine similarity
+3. Stack the K concept vectors into a tensor: (1, K, d_model)
+4. Project through memory_projector: Linear(512, 512) per vector
+5. Build concept-only prefix: (1, 16, d_model) [no memory in prefix]
+6. Pass prefix to decoder via self-attention prepend
+7. Pass projected memory to decoder via cross-attention in every layer
+```
+
+This architecture gives memory its own dedicated pathway. The decoder's
+self-attention processes the concept prefix alongside generated text
+(deciding what to say based on the current prompt), while cross-attention
+in every layer independently queries the memory (deciding how past
+experience should influence the response).
+
+The memory projector learns a transformation from stored concept vectors
+into a representation space that the cross-attention layers can
+efficiently query. This is distinct from the concept projector, which
+maps the current concept vector into prefix embeddings for self-attention.
+The two projectors learn different tasks: the concept projector learns
+"how to explain the current prompt to the decoder," while the memory
+projector learns "how to make past experiences accessible to cross-attention."
+
+### Training With Memory From Day One
+
+A critical lesson from V4 (mistake M-004): the decoder was initially
+trained WITHOUT memory context, then memory was added at inference time.
+The result was catastrophic -- the decoder had never learned to attend
+to memory vectors, so they were treated as random noise that corrupted
+generation.
+
+GESTALT V5 trains the decoder with memory from the very first training
+step. During SFT, a memory pool accumulates concept vectors from processed
+batches. After a warmup period (500 steps), each training step has a 50%
+chance of including randomly sampled memory vectors as prefix context:
+
+```rust
+let use_mem = step >= memory_warmup
+    && memory_pool.len() >= memory_k
+    && rng.next_f64() < memory_prob;
+
+let mem_tensor = if use_mem {
+    // Sample K random concept vectors from the pool
+    // ...
+    Some(tensor)
+} else {
+    None
+};
+
+let logits = brain.forward_from_concept_t(
+    &concept_vec, &input_t, mem_tensor.as_ref(), true
+)?;
+```
+
+Inside `forward_from_concept_t`, the memory is routed through cross-
+attention, not the prefix. The concept-only prefix is built from
+`concept_vec`, and memory (if present) is projected and passed as the
+cross-attention K/V source:
+
+```rust
+pub fn forward_from_concept_t(&self, concept_vec, response_ids, memory_vecs, train) {
+    let prefix = self.build_prefix(concept_vec, None)?;  // concept-only prefix
+    let memory = match memory_vecs {
+        Some(mem) => Some(self.memory_projector.forward(mem)?),
+        None => None,
+    };
+    self.language_decoder.forward_with_prefix_t(&prefix, response_ids, train, memory.as_ref())
+}
+```
+
+This means the decoder learns two things simultaneously:
+1. How to generate responses conditioned on concept prefix alone (self-attention)
+2. How to use (and when to ignore) external memory (cross-attention)
 
 ---
 
-## 18. The Gallery — How We Measure Quality
+## 8. The Planner -- FSM-Constrained Decoding
 
-### What the Gallery Is
+The planner generates structured tool execution plans. Unlike the language
+decoder (which produces free-form text), the planner must produce
+syntactically valid plans that conform to a specific grammar. GESTALT
+achieves this through a finite state machine (FSM) that masks the
+transformer's output at each generation step.
 
-The gallery is GESTALT's comprehensive evaluation suite. 166 prompts across 15 categories, each designed to probe a different capability:
+### Why Constrained Decoding?
 
-```
-Category          Prompts  Tests
-────────────────  ───────  ────────────────────────────────────
-Greetings         12       "hello", "good morning", "hey there"
-Identity          15       "who are you", "tell me about yourself"
-Technical         18       "what is a transformer", "explain TCP"
-Philosophy        12       "what is beauty", "meaning of life"
-Emotional         14       "I'm scared of failing", "I feel stuck"
-Debugging         10       "the build broke", "tests are failing"
-Humor             8        "tell me a joke", "what's funny"
-SelfReflection    10       "are you conscious", "do you dream"
-DeepThought       12       "what is time", "nature of reality"
-EngineeringWisdom 8        "best practices", "when to refactor"
-Profound          10       "what defines us", "what matters"
-PopCulture        10       "thoughts on NGE", "favorite anime"
-OOD_Creative      10       Novel prompts unseen in training
-OOD_Knowledge     10       Factual questions (out of domain)
-Temperature       7        Same prompt at 0.0, 0.3, 0.5, 0.7, 1.0
-```
-
-### How Gallery Is Run
-
-```bash
-# Full gallery with default config
-./target/release/gestalt gallery --config default
-
-# Gallery with specific merge count
-GESTALT_MERGES=200 ./target/release/gestalt gallery --config default
-```
-
-The gallery loads the best checkpoint (`brain_checkpoint.safetensors`), rebuilds the tokenizer from the training corpus, and generates a response for each of the 166 prompts at temperature 0.7 with top-K=40 and top-P=0.9.
-
-### How We Score
-
-Each response is manually evaluated on four dimensions:
-
-**Coherence** — Does the response form grammatically correct, semantically meaningful sentences? Broken tokens, random words, or incomplete sentences score 0. Fluent English scores 1.
-
-**Relevance** — Does the response actually address the prompt? "hello" should produce a greeting, not a technical explanation. On-topic scores 1.
-
-**Personality** — Does it sound like JARVIS? Dry wit, competence, warmth without being saccharine. Generic "I'm an AI assistant" scores 0. "Evening. I take it we have work to do?" scores 1.
-
-**Sustainability** — How many tokens before the response degrades? Some responses start strong and collapse into word salad after 15 tokens. Full-length coherent responses are the goal.
-
-### Current Results: v22 Hero
-
-The v22 hero checkpoint (merges=200, 30K steps, 21K curated pairs) is our best model:
+Consider a plan for "search for GPU policy and open it":
 
 ```
-Overall:        ~40-45% coherent openings, ~10-15% fully coherent responses
-Greetings:      ~70% coherent (strongest category)
-Technical:      ~30% coherent openings, rapid degradation
-Philosophy:     ~25% coherent (interesting attempts, then word salad)
-Emotional:      ~40% (good empathetic openings)
-OOD_Creative:   ~15% (novel prompts are hardest)
-OOD_Knowledge:  ~5% (factual questions are out of domain)
+STEP RG PAT1 STEP REPOREAD FILE0 EOP
 ```
 
-The pattern is clear: the model has learned response PATTERNS (how to start a greeting, how to open a technical explanation) but not response SUSTENANCE (how to maintain coherent text for a full paragraph). This is the capacity bottleneck — d=512 with 21K pairs learns fragments but not full responses.
+This means: Step 1 uses ripgrep with pattern PAT1, Step 2 reads FILE0
+(determined by step 1's output), then end-of-plan.
 
-### Gallery as Diagnostic Tool
-
-The gallery isn't just an evaluation — it's a diagnostic. By comparing gallery results across training runs, we can see exactly what changed:
+An unconstrained language model might produce:
 
 ```
-v19 (merges=2000): 0% coherent → vocabulary too large
-v20 (merges=2000): 30% coherent → dropout helps, but merges still too many
-v22 (merges=200):  45% coherent → right vocabulary size
-v23 (92K corpus):  grammar good, personality gone → corpus quality matters
+STEP STEP RG RG FILE0 TALK EOP STEP
 ```
 
-Each gallery run tells a story about what the model learned and what it didn't. The gallery is the ground truth — loss curves can deceive, but generated text doesn't lie.
+This is syntactic nonsense -- two STEPs in a row, actions without steps,
+end-of-plan followed by more tokens. Instead of hoping the model "learns"
+correct syntax, GESTALT enforces it mechanically.
+
+### The 17-State FSM
+
+The FSM defines which tokens are legal at each point in the plan:
+
+```
+State: Start
+  Legal tokens: STEP, EOP, THINK
+  Transition: STEP -> AfterStep
+              THINK -> InThink
+              EOP -> done
+
+State: AfterStep
+  Legal tokens: [all 15 action tokens]
+  Transition: RG -> AfterRg
+              REPOREAD -> AfterRepoRead
+              PATCHDRYRUN -> AfterPatch
+              MEMADD -> AfterMemAdd
+              MEMSEARCH -> AfterMemSearch
+              PROVEALGEBRA -> AfterProve
+              (others) -> AfterActionNoArgs
+
+State: AfterActionNoArgs
+  Legal tokens: STEP, EOP
+  Transition: STEP -> AfterStep (new step)
+              EOP -> done
+
+State: AfterRg
+  Legal tokens: PAT0-PAT5
+  Transition: (any PAT) -> AfterActionNoArgs
+
+State: AfterRepoRead
+  Legal tokens: FILE0-FILE9, FROM0-FROM7
+  Transition: FILE -> AfterActionNoArgs
+              FROM -> AfterRepoReadFrom
+
+State: AfterRepoReadFrom
+  Legal tokens: PICK0-PICK128
+  Transition: (any PICK) -> AfterActionNoArgs
+
+State: InThink
+  Legal tokens: ENDTHINK, NEEDS, THEN, IF, BECAUSE, [actions]
+  Transition: ENDTHINK -> Start
+              (others) -> InThink
+
+... (and so on for all 17 states)
+```
+
+### How FSM Masking Works
+
+At each generation step, the current FSM state determines which tokens
+are legal. All other tokens receive -infinity logits:
+
+```rust
+fn apply_fsm_mask(logits: &Tensor, valid_ids: &[u32], vocab_size: usize, device: &Device) {
+    let mut mask_data = vec![f32::NEG_INFINITY; vocab_size];
+    for &id in valid_ids {
+        mask_data[id as usize] = 0.0;      // keep these tokens
+    }
+    let mask = Tensor::from_vec(mask_data, (1, vocab_size), device)?;
+    logits + mask
+}
+```
+
+After adding the mask, softmax guarantees zero probability for all invalid
+tokens. The model then picks the highest-scoring valid token using argmax
+(greedy decoding -- sampling is not needed because plans are deterministic).
+
+### The Decoding Loop
+
+```rust
+pub fn greedy_decode(model, tok, prompt_ids, max_tokens, device) {
+    let mut context = tok.pad_or_truncate(prompt_ids, seq_len);
+    let mut state = FsmState::Start;
+    let mut steps_emitted = 0;
+
+    for _ in 0..max_tokens {
+        let logits = model.forward(&input)?;
+        let last_logits = logits.i((0, seq_len - 1, ..))?;
+
+        let valid = valid_tokens_for_state(state, tok, steps_emitted);
+        let masked = apply_fsm_mask(&last_logits, &valid, vocab_size, device)?;
+
+        let token_id = masked.argmax(D::Minus1)?;
+        let token_str = tok.token(token_id);
+
+        if token_str == "EOP" { break; }
+
+        state = fsm_transition(state, &token_str, &mut steps_emitted);
+        context.remove(0);         // slide window
+        context.push(token_id);    // append new token
+    }
+}
+```
+
+### The Chain-of-Thought Extension
+
+The FSM includes a THINK/ENDTHINK block that lets the model reason before
+committing to a plan:
+
+```
+THINK NEEDS CARGOTEST BECAUSE RG THEN FIXTESTS ENDTHINK
+STEP RG PAT1 STEP CARGOTEST STEP FIXTESTS EOP
+```
+
+The THINK block is optional (only emittable from the Start state, and only
+on the first step). Inside THINK, the model can use reasoning keywords
+(NEEDS, BECAUSE, THEN, IF) and reference action tokens. The ENDTHINK
+token returns to the Start state, where actual plan steps begin.
+
+### Why This Matters
+
+With FSM-constrained decoding, GESTALT achieves 21/21 on its plan benchmark
+-- every goal produces a syntactically valid, semantically correct plan.
+The constraint eliminates an entire class of failure modes (malformed plans)
+and lets the transformer focus entirely on choosing the RIGHT actions,
+not on producing valid syntax.
 
 ---
 
-## 19. Gradient Accumulation — Scaling Up
+## 9. The Policy Heads -- Making Decisions
 
-### The Problem: d=1024 OOMs on 16GB VRAM
+While the planner generates sequential plans, the policy heads make
+immediate classification decisions: what is the user's intent, and what
+actions should be taken?
 
-The current model is d=512 (~50M parameters). The target is d=1024 (~200M parameters). At d=1024, even a batch size of 2 exceeds the 16GB VRAM on the RTX 5070 Ti. candle doesn't support fp16 training, gradient checkpointing, or memory-efficient attention — it's f32 all the way.
+### Architecture
 
-```
-d=512:  ~5.3GB VRAM at batch=48  ✓ Fits easily
-d=1024: ~18GB VRAM at batch=2   ✗ OOM on 16GB card
-```
-
-### The Solution: Gradient Accumulation
-
-Instead of computing the gradient from one large batch, compute it from N small batches and average:
+The policy pipeline uses a separate transformer backbone (not shared with
+the language pipeline) that encodes the goal text into hidden states, then
+applies mean pooling and five classification heads:
 
 ```
-Without accumulation (batch=32):
-  Forward pass on 32 examples
-  Backward pass → gradients
-  Optimizer step
-
-With accumulation (micro_batch=2, accum_steps=16, effective_batch=32):
-  For i in 0..16:
-    Forward pass on 2 examples
-    Backward pass → gradients for this micro-batch
-    Accumulate: total_grads += micro_grads / 16
-  Optimizer step (using accumulated gradients)
+goal_bytes: (batch, seq_len)           raw bytes, 0-255 (NO special tokens)
+    |
+policy_backbone: WiredTransformer       d=256, 3 layers, 8 heads
+    |
+hidden: (batch, seq_len, 256)
+    |
+mean_pool: (batch, 256)                average over all positions
+    |
+    +-> head_intent:  Linear(256, 16)               -> intent class
+    +-> head_actions: Linear(256, 6*16) -> reshape   -> 6 action slots
+    +-> head_patterns: Linear(256, 6*6) -> reshape   -> 6 pattern slots
+    +-> head_files:   Linear(256, 6*10) -> reshape   -> 6 file slots
+    +-> head_picks:   Linear(256, 6*129) -> reshape  -> 6 argument slots
 ```
 
-Mathematically equivalent. The gradients are the same (averaged over the same 32 examples). But memory usage is that of batch=2 instead of batch=32.
+**Important encoding difference:** The policy backbone uses raw byte
+encoding (0-255, vocab size 256), NOT the TalkTokenizer (which adds PAD,
+BOS, EOS for vocab 259). This is a separate encoding path that caused a
+real bug (M-026) when pipeline code accidentally used the wrong tokenizer.
 
-### The Implementation Challenge
+### The Five Heads
 
-candle's `GradStore::new()` is **private** — you can't construct a gradient store from scratch. You can only get one from `tensor.backward()`. But `GradStore::insert()` and `GradStore::get()` are public. So:
+**Intent (16 classes):** What is the user trying to do? Run tests, greet,
+search code, fix tests, add memory, prove algebra, etc.
+
+**Actions (6 slots x 16 tools):** For each of up to 6 steps, which tool
+should be used? Tools include: TALK, CARGOTEST, FIXTESTS, RG, REPOREAD,
+PATCHDRYRUN, PROVEALGEBRA, MEMADD, MEMSEARCH, etc. Slot 0 is always
+ACT_END for single-action intents.
+
+**Patterns (6 slots x 6):** For tools that take pattern arguments (like
+ripgrep), which pattern index? PAT0-PAT5.
+
+**Files (6 slots x 10):** For tools that take file arguments, which file
+index? FILE0-FILE9.
+
+**Picks (6 slots x 129):** For tools that take general arguments, which
+argument index? PICK0-PICK128.
+
+### Training the Policy
+
+Policy training uses a curriculum of 64 goal-action pairs. Each pair maps
+a natural language goal to the correct intent, action sequence, and
+arguments:
+
+```
+"hello" -> intent=HELLO, actions=[TALK, END, ...], patterns=[0,0,...], ...
+"run the tests" -> intent=RUN_TESTS, actions=[CARGOTEST, END, ...], ...
+"search jarviscmd then open it" -> intent=COMPOSITE,
+    actions=[RG, REPOREAD, END, ...], patterns=[PAT1, ...], files=[FILE0, ...]
+```
+
+The loss is a weighted sum of cross-entropy losses over all five heads:
+
+```
+total_loss = 2.0 * CE(intent) + 2.0 * CE(actions) + 2.0 * CE(patterns)
+           + 2.0 * CE(files) + 1.0 * CE(picks)
+```
+
+Intent and actions are weighted higher because they are the most critical
+decisions. Pick accuracy is less important for overall system behavior.
+
+---
+
+## 10. Training -- Teaching the Brain
+
+Training in GESTALT is a multi-phase pipeline. Each phase trains a
+different component, and the phases are largely independent.
+
+### Phase 1: Brain SFT (Supervised Fine-Tuning)
+
+This is the primary training phase for the language model. The brain
+learns to generate JARVIS-style responses given prompts.
+
+#### The Training Corpus
+
+The training corpus contains 92,273 unique (prompt, response) pairs drawn
+from six sources, all revoiced through a JARVIS personality pipeline:
+
+| Source | Pairs | Description |
+|--------|-------|-------------|
+| SlimOrca | 29,000 | Diverse instruction-following |
+| UltraChat | 25,000 | Multi-turn conversations |
+| Handwritten | 21,000 | Original JARVIS dialogue |
+| WizardLM | 10,000 | Complex instructions |
+| No Robots | 3,500 | Human-written responses |
+| Alpaca + OASST2 + Dolly | 3,200 | Mixed instruction data |
+
+The corpus is embedded at compile time via `include_str!` and parsed
+from JSON on first access. This means the training data is baked into
+the binary -- no external data files needed at runtime.
+
+#### Train/Validation Split
+
+The corpus is split 90/10 into training and validation sets using a
+seeded Fisher-Yates shuffle (seed=42 for reproducibility). The validation
+set is used for early stopping and never appears during training.
+
+#### The SFT Loop
+
+```
+For each step in 0..sft_steps:
+    1. Sample a minibatch of batch_size dialogues
+    2. For each dialogue:
+       a. Encode prompt with TalkTokenizer -> left-padded goal_ids
+       b. Encode response with ConceptTokenizer -> right-padded response_ids
+       c. Apply PAD-denoising: randomly replace tokens with PAD (10% rate)
+    3. Forward pass:
+       a. Encode goal_ids -> concept_vec (encoder)
+       b. Maybe sample memory vectors from memory pool
+       c. Build prefix from concept_vec + optional memory
+       d. Decode prefix + response_ids -> logits
+    4. Compute weighted cross-entropy loss (weight=0 for PAD positions)
+    5. Gradient accumulation: accumulate micro-batch gradients
+    6. Optimizer step (every accum_steps micro-batches):
+       a. AdamW with cosine LR schedule
+       b. Learning rate: warmup from 0 to 3e-4 over 10% of training,
+          then cosine decay to 3e-6
+    7. Every 1000 steps: compute validation loss, check early stopping
+```
+
+#### PAD-Denoising: Forcing Cross-Attention
+
+A critical training technique: during each step, 10% of non-special
+tokens in the response are randomly replaced with PAD (the padding token).
+This forces the decoder to attend to the concept prefix tokens, because
+the local autoregressive context has been partially destroyed.
+
+Without denoising, the decoder learns to predict the next byte purely
+from the preceding bytes (bigram/trigram statistics), ignoring the prefix
+entirely. The concept encoder receives no gradient signal, and the model
+produces the same generic response regardless of the prompt. This failure
+mode was observed in early training (M-029): loss plateaued at 2.15 --
+exactly matching an unconditional bigram model.
+
+PAD-denoising introduces information gaps that can only be filled by
+attending to the prefix. The decoder learns: "when the local context is
+degraded, look at the concept tokens to figure out what you should be
+saying."
+
+#### Cosine Learning Rate Schedule
+
+The learning rate follows a cosine curve with linear warmup:
+
+```
+if step < warmup_steps:
+    lr = base_lr * (step + 1) / warmup_steps        # linear warmup
+else:
+    progress = (step - warmup_steps) / remaining_steps
+    lr = min_lr + 0.5 * (base_lr - min_lr) * (1 + cos(pi * progress))
+```
+
+This starts at zero, ramps linearly to base_lr over the warmup period
+(10% of training), then smoothly decays following a cosine curve. The
+cosine schedule provides a natural annealing that spends more time at
+moderate learning rates (the productive regime) and less time at very
+high or very low rates.
+
+#### Early Stopping
+
+GESTALT uses patience-based early stopping on validation loss:
+
+```
+If no new best val_loss for patience consecutive checks:
+    Stop training, restore best checkpoint weights
+```
+
+The default patience is 20 checks. Each check happens at the logging
+interval (every 1000 steps). So training stops if no improvement is
+seen for 20,000 steps -- generous enough to avoid premature stopping
+on noisy validation curves.
+
+When a new best val_loss is found, the model weights are saved to
+`checkpoints/brain_best_sft.safetensors`. After training completes (or
+early stops), these best weights are loaded back:
+
+```rust
+if std::path::Path::new("checkpoints/brain_best_sft.safetensors").exists() {
+    load_checkpoint(&varmap, "checkpoints/brain_best_sft.safetensors", device)?;
+}
+```
+
+This ensures the model returned by `train_brain_talk()` always has the
+best validation loss weights, not the weights from the last training step
+(which may have overfit past the optimum).
+
+#### Gradient Accumulation
+
+At d_model=512 with batch_size=48, training fits comfortably in 16GB VRAM.
+But at d_model=1024 (Phase 2), even batch_size=2 approaches the memory
+limit.
+
+Gradient accumulation simulates larger batches by processing multiple
+micro-batches and accumulating their gradients before taking a single
+optimizer step:
+
+```
+effective_batch_size = micro_batch_size * accum_steps
+```
+
+For Phase 2: micro_batch=2, accum_steps=16, effective_batch=32.
+
+The implementation properly scales the loss by 1/accum_steps so that
+accumulated gradients are averaged, not summed:
 
 ```rust
 pub fn accumulate_and_step(&mut self, loss: &Tensor) -> Result<Option<usize>> {
-    // Scale loss by 1/N for gradient averaging
     let scaled = if self.config.grad_accum_steps > 1 {
         (loss / self.config.grad_accum_steps as f64)?
     } else {
         loss.clone()
     };
-
     let grads = scaled.backward()?;
 
-    // First micro-batch: store as-is (this gives us a GradStore to work with)
-    // Subsequent micro-batches: add to existing
+    // Add to accumulated gradients
     match &mut self.accum_grads {
         None => { self.accum_grads = Some(grads); }
         Some(accum) => {
             for var in self.varmap.all_vars() {
-                let t = var.as_tensor();
-                if let Some(new_g) = grads.get(t) {
-                    let sum = if let Some(existing) = accum.get(t) {
-                        (existing + new_g)?
-                    } else {
-                        new_g.clone()
+                if let Some(new_g) = grads.get(var.as_tensor()) {
+                    let sum = match accum.get(var.as_tensor()) {
+                        Some(existing) => (existing + new_g)?,
+                        None => new_g.clone(),
                     };
-                    accum.insert(t, sum);
+                    accum.insert(var.as_tensor(), sum);
                 }
             }
         }
     }
 
     self.accum_count += 1;
-
     if self.accum_count >= self.config.grad_accum_steps {
-        // Step optimizer with accumulated (averaged) gradients
-        if let Some(grads) = self.accum_grads.take() {
-            self.optimizer.step(&grads)?;
-        }
+        // Step optimizer with averaged gradients
+        self.optimizer.step(&self.accum_grads.take().unwrap())?;
         self.accum_count = 0;
-        self.step_count += 1;
-        self.scheduler.step();
-        return Ok(Some(self.step_count));
+        // Update learning rate
+        let new_lr = self.scheduler.step();
+        self.optimizer.set_learning_rate(new_lr);
     }
-
-    Ok(None)  // Not a full step yet
 }
 ```
 
-### Important: The Previous Implementation Was Wrong
+**A previous bug (fixed):** The original implementation called
+`backward_step` per micro-batch, which performed N optimizer steps instead
+of 1. This meant the learning rate was effectively N times higher than
+intended, causing training instability.
 
-The original `accumulate_and_step` called `optimizer.backward_step()` per micro-batch. This means N optimizer steps with scaled loss — NOT gradient accumulation. The optimizer updates weights N times instead of once, with each update based on only 1/N of the batch. Mathematically different, practically worse.
+### Phase 2: Concept Tokenizer Bootstrap
 
-The correct implementation calls `loss.backward()` to get raw gradients, accumulates them across micro-batches, then calls `optimizer.step(&grads)` exactly ONCE with the combined gradients.
+After brain training, the concept tokenizer is bootstrapped from the
+corpus:
 
-### Configuration
-
-```rust
-BrainConfig {
-    grad_accum_steps: 1,   // default: no accumulation
-    // phase2:
-    grad_accum_steps: 16,  // effective batch = 2 × 16 = 32
-}
+```
+1. Scan all corpus text for byte n-grams (2-8 bytes)
+2. Filter by minimum frequency (default: 5 occurrences)
+3. Score: frequency * (pattern_length - 1)
+4. Take top-N by score (default: 200 merges)
+5. Assign token IDs starting at 259
+6. Save to checkpoints/concept_tokenizer.bin
 ```
 
-Override with `GESTALT_ACCUM_STEPS=16` environment variable. All 127 tests pass with accumulation enabled.
+This produces a ConceptTokenizer with ~459 vocab that achieves ~2x
+compression. The decoder is then re-trained with this tokenizer, allowing
+it to process longer responses within the same sequence length.
+
+### Phase 3: Plan-LM Training
+
+The planner is trained with standard supervised fine-tuning on 21 goal-plan
+pairs. Each goal maps to a reference plan:
+
+```
+"hello" -> [STEP, TALK, EOP]
+"run the tests" -> [STEP, CARGOTEST, EOP]
+"search jarviscmd and then open it" -> [STEP, RG, PAT1, STEP, REPOREAD, FILE0, EOP]
+```
+
+The loss uses per-position weighting: STEP tokens are weighted at 0.1
+(they are always at predictable positions, so the model learns them
+trivially) and action tokens at 1.0 (these are the interesting decisions).
+
+Without this weighting, STEP tokens dominate the gradient signal (M-002):
+they represent 27% of all targets and are easy to predict, so the optimizer
+spends all its effort perfecting STEP prediction while action tokens remain
+at random chance (0.7% probability).
+
+### Phase 4: Policy Training
+
+Policy training uses the 64-task curriculum described in Section 9. It
+runs for 16,384 steps with a separate transformer backbone (d=256, 3
+layers) and AdamW optimizer.
+
+### The Training Pipeline
+
+The `gestalt train` command runs all phases in sequence:
+
+```
+1. Build ConceptTokenizer (or load from checkpoint)
+2. Brain SFT training (encoder + decoder + projector)
+3. Bootstrap concept tokenizer from trained encoder
+4. Plan-LM SFT training (planner)
+5. Policy training (classification heads)
+6. Run gallery evaluation (comprehensive generation test)
+7. Save checkpoints
+```
+
+The `--resume` flag skips brain SFT and loads from checkpoint, going
+straight to tokenizer/planner/policy training. This saves ~90 minutes
+when iterating on non-brain components.
 
 ---
 
-## 20. Where It Stands Now
+## 11. What We Learned -- Findings From v18 Through v23
 
-### Source Files (February 2026)
+### v18: Memorization Confirmed (1,749 pairs)
 
-| File | ~LOC | Tests | What It Does |
-|------|------|-------|-------------|
-| brain.rs | 2,000 | 20 | Unified brain: encoder, decoder, policy, memory, generation |
-| transformer.rs | 650 | 8 | Causal transformer with gradient-safe RMSNorm and softmax |
-| tokenizer.rs | 1,100 | 22 | PlanTokenizer (373) + ConceptTokenizer (adaptive BPE) |
-| planner.rs | 700 | 6 | 17-state FSM constrained plan decoder |
-| training.rs | 550 | 10 | AdamW, cosine LR, weighted CE, early stopping, grad accum |
-| eval.rs | 500 | 10 | 21-goal plan bench + brain policy bench |
-| executor.rs | 475 | 9 | 15 tools, 3 safety levels, subprocess execution |
-| pipeline.rs | 450 | 8 | run_goal() orchestration, step chaining |
-| memory.rs | 400 | 9 | SQLite episodic memory, persistence, consolidation |
-| session.rs | 200 | 10 | Ring buffer, ReAct phases |
-| main.rs | 200 | - | CLI: train / gallery / serve / run |
-| lib.rs | 14 | - | Module root |
-| integration.rs | 200 | 8 | End-to-end pipeline tests |
-| **Total** | **~7,400** | **127** | |
+**Result:** val_loss=2.02, coherent outputs are verbatim corpus entries
 
-### Test Results
+With only 1,749 training pairs and d_model=512, the model has roughly
+3 dimensions per example -- more than enough to memorize every sample.
+Coherent outputs were exact copies from training data; novel prompts
+produced gibberish.
+
+**Lesson:** The architecture works. The model CAN learn to generate
+coherent text from concept vectors. But 1,749 pairs is not enough data
+for generalization.
+
+### v19: More Data, No Dropout (21K pairs)
+
+**Result:** best val_loss=3.55 at step 6K, 0% coherent gallery
+
+Scaling to 21,000 pairs with 2,000 BPE merges. The model began overfitting
+at step 6,000. Zero coherent outputs in the evaluation gallery.
+
+**Lesson:** Larger vocabulary (2,259 tokens) is harder to learn. Overfitting
+begins early without regularization.
+
+### v20: The Dropout Discovery (21K pairs)
+
+**Result:** best val_loss=3.26 at step 8K, ~30% coherent
+
+Adding dropout=0.1 extended training life from 6K (v19) to 13K+ steps
+before overfitting. This single change brought coherence from 0% to ~30%.
+
+**Lesson:** Dropout is essential for small models on limited data. It
+prevents the model from memorizing training examples and forces it to
+learn general patterns.
+
+### v22: The Vocabulary Breakthrough (21K pairs, 200 merges)
+
+**Mock hero result:** val_loss=2.04 at 5K steps, grammar breakthrough
+**Hero result:** val_loss=1.9 at 30K steps, ~40-45% coherent
+
+The key change: reducing BPE merges from 2,000 to 200 (vocab from 2,259
+to 459). This was the single most impactful hyperparameter change in the
+entire project.
+
+**Why it works:** With 2,259 tokens, many merge tokens appear only a few
+times in the corpus. The model cannot learn a reliable embedding for a
+token it has seen 3 times. With 459 tokens, every token appears frequently
+enough for the model to learn what it means.
+
+The grid search results were dramatic: at 300 steps, merges=200 had
+val_loss=3.56 vs merges=2000 at val_loss=5.53. The difference grew
+larger with more training.
+
+### v23: Scaling to 92K Pairs
+
+**Attempt 1:** Crashed WSL at step 11K (OOM from Claude Code memory bloat,
+not the training binary). val_loss=1.88 before crash. Gallery showed fluent
+grammar but semantic disconnection from prompts -- "generic AI assistant"
+mode.
+
+**Key finding:** val_loss=1.88 on 92K mixed-source data is NOT equivalent
+to val_loss=1.9 on 21K curated data. The mixed corpus includes diverse
+instruction-following data that dilutes the JARVIS personality. Corpus
+quality matters more than quantity.
+
+**Attempt 2:** Restarted with the same configuration, ongoing.
+
+### Cross-Cutting Findings
+
+**Fewer BPE merges = faster convergence.** This was the single most
+important finding. It contradicts the common ML wisdom that larger
+vocabularies are better -- that wisdom applies to models trained on
+billions of tokens, not thousands.
 
 ```
-$ cargo test --release --features cuda
-running 119 tests ... ok         (lib)
-running 8 tests ... ok           (integration)
-test result: 127 passed; 0 failed; 0 ignored
+At 300 training steps, validation loss by merge count:
+  50 merges:   2.79    (barely compresses, fast to learn)
+  200 merges:  3.56    (2x compression, fast to learn)  <-- sweet spot
+  2000 merges: 5.53    (4x compression, too many tokens to learn)
 ```
 
-Every test runs, every test passes. This includes gradient flow tests, tokenizer encode/decode round-trips, plan FSM validation, memory persistence, cross-session recall, and end-to-end pipeline execution.
+**Dropout extends training life by 2x.** Dropout=0.1 is not optional for
+models of this scale.
 
-### Phase Progress
+**Mean pooling over last-token pooling.** Last-token pooling produced
+identical concept vectors because all inputs ended with EOS at the same
+position.
 
-```
-Phase 0: Foundation Port        ████████████████████ 100%
-Phase 1: Tool Execution         ████████████████████ 100%
-Phase 2: BPE + Language         ██████████████░░░░░░  70%  (tokenizer done, v22 trained, eval done)
-Phase 2.5: Memory Integration   ████████████████████ 100%  (code complete, T-020/T-021 done)
-Phase 3: Memory-Augmented Train ██░░░░░░░░░░░░░░░░░░  10%  (architecture ready, training pending)
-Phase 4: Multi-Turn + ReAct     ████░░░░░░░░░░░░░░░░  20%  (session ring buffer done)
-Phase 5: Online Learning        ░░░░░░░░░░░░░░░░░░░░   0%
-Phase 6: Proactive + JARVIS     ░░░░░░░░░░░░░░░░░░░░   0%
-```
+**Right-padding for decoders, left-padding for encoders.** The decoder
+generates text starting at BOS (position 0), so BOS must always be at
+position 0. Padding goes at the end. The encoder just needs the content
+together; padding goes at the start. Mixing these up causes RoPE position
+mismatches between training and inference (M-003).
 
-### Current Training Run
+**PAD-denoising at 10% is necessary.** Below 10%, the decoder ignores the
+prefix and becomes an unconditional bigram model (M-029). Above 20%, too
+much information is destroyed and training becomes inefficient.
 
-v23 is running: d=512, 92K pairs, batch=48, 50K steps. GPU at 99% utilization. Even though we know the 92K corpus has personality issues, training it to completion gives us a data point: does longer training (50K vs 11K steps) sharpen the personality, or is it permanently diluted?
+**Gradient flow must be verified BEFORE training.** Twelve training runs
+(M-031, M-032) failed because candle-nn's RmsNorm and softmax broke
+gradient flow. One gradient check test would have caught this immediately.
 
-### Hardware
+**Repetition penalty must match tokenization granularity.** Token-level
+repetition penalty (as in GPT-2) destroys byte-level output because
+individual bytes like 'e' naturally repeat. N-gram penalty (4-gram) is
+the correct approach for byte-level vocabularies (M-044).
 
-- **GPU**: NVIDIA RTX 5070 Ti — 16GB VRAM, Blackwell architecture
-- **RAM**: 24GB system memory (28GB WSL allocation)
-- **OS**: WSL2 on Windows (Linux kernel 6.6.87)
-- **VRAM usage**: ~5.3GB during training (model + optimizer + activations), ~10.7GB headroom
-- **Throughput**: 2.2 steps/sec at d=512, batch=48
+**Sampling operation order matters.** Temperature must be applied before
+top-K and top-P filtering, because it changes the shape of the probability
+distribution that those filters operate on. Applying top-P at T=1.0 and
+then sampling at T=0.5 produces a different (looser) nucleus than applying
+temperature first. The correct order is: temperature -> top-K -> top-P ->
+sample (M-046).
+
+**Always save best checkpoint weights, not last-step weights.** Early
+stopping saves the best-validation-loss weights incrementally, but the
+training function returned the model with last-step weights in memory.
+If training overshot past the optimum, the model returned was worse than
+the best checkpoint on disk. The fix: reload the best checkpoint after
+training exits, before any downstream evaluation (M-045).
+
+**Training an architecture you know is wrong wastes compute.** When an
+audit or design review reveals the final architecture (cross-attention for
+memory, YaRN for context extension, KV cache for generation), implement
+those changes before launching long training runs. Training on an
+architecture that is about to be replaced is wasted GPU time. Quick
+validation runs (500 steps) on non-final architecture are fine; full 30K+
+step runs are not (M-048).
+
+**DA (denoising autoencoder) fine-tuning at high learning rate destroys
+coherence.** A DA phase that trains on isolated byte positions at lr=1e-4
+catastrophically interfered with the autoregressive flow that SFT
+established. The model became good at predicting individual bytes but
+lost sequence-level coherence. SFT-only training (with early stopping)
+is the proven-optimal approach for GESTALT's current scale (M-039).
 
 ---
 
-## 21. The Road Ahead
+## 12. What Comes Next
 
-### Near Term: Scale Up (d=1024)
+### Recently Implemented (Phase 2.5)
 
-The biggest single improvement available. Going from d=512 to d=1024 means:
-- 4x more capacity per concept vector (1024 dimensions vs 512)
-- 8 encoder + 8 decoder layers (vs 1+4 now)
-- ~200M parameters total (vs ~50M now)
-- Should sustain coherence well past the current 15-token wall
+Several major architectural improvements have been completed and are
+documented throughout this paper:
 
-Gradient accumulation is implemented and tested. The next step is a d=1024 training run with `micro_batch=2, accum_steps=16` (effective batch=32).
+- **YaRN RoPE Scaling** (Section 4): Frequency-selective context extension
+  with three bands (high/mid/low) and attention temperature compensation.
+  Enables the model to process sequences longer than its training window
+  at inference time.
 
-### Near Term: Quality-Filtered Corpus
+- **Cross-Attention Memory** (Section 4): Dedicated cross-attention layers
+  in the decoder for querying external memory. Replaces the previous prefix
+  concatenation approach. Memory now has its own attention pathway separate
+  from text generation.
 
-The v23 experiment proved that more data doesn't mean better output. The next corpus expansion will:
+- **RoPE Prefix Decoupling** (Section 4): Prefix tokens (concept projections)
+  receive no positional encoding. Only text tokens get RoPE, starting at
+  position 0. This removes artificial positional dependencies between the
+  concept projector and the decoder.
 
-1. Start with the 21K curated pairs (v22's corpus — proven personality)
-2. Filter aggressively: each new pair must match the JARVIS voice profile
-3. Target 50K pairs with consistent personality, not 100K with diluted personality
-4. Add more of what works: emotional intelligence, technical wit, cultural references
+- **KV Cache with Memory Threading** (Section 4): Two-phase generation
+  (prefill + step) with cached K/V tensors. Memory is threaded through
+  every cached forward call for cross-attention access.
 
-### Phase 3: Memory-Augmented Training
+### Planned: Perceiver IO Encoder
 
-Train the decoder with memory prefix containing randomly sampled prior dialogues. The `memory_projector` weights (currently random) will learn to project retrieved memories into useful context.
-
-This is the M-004 fix in action — the architecture is ready, the training pipeline has the hooks, we just need to pull the trigger on a training run.
-
-### Phase 4: Multi-Turn + ReAct
-
-Make GESTALT conversational and autonomous:
-
-- **Session state**: 32-turn ring buffer for conversation context. Already implemented in `session.rs`.
-- **ReAct loop**: Reason → Act → Observe → Reason for complex, multi-step tasks. The model doesn't just execute a plan once — it observes the results and decides what to do next.
-- **Multi-turn context**: Maintain coherence across conversation turns. "Open that file" should know what "that" refers to from the previous turn.
-
-### Phase 5: Online Learning
-
-This is where GESTALT becomes fundamentally different from static models:
-
-- **Experience buffer**: Store every interaction with automatic success/failure tagging
-- **Micro-training**: After every N interactions, fine-tune on successful ones (100-500 steps)
-- **Memory consolidation**: Compress repetitive episodes into abstract knowledge
-- **GRPO**: Group Relative Policy Optimization on plan quality — learn from which plans succeed and which fail
-
-The result: a model that gets better at YOUR tasks, on YOUR codebase, over time.
-
-### Phase 6: Proactive Intelligence
-
-The endgame. GESTALT anticipates and suggests:
-
-- **Persistent HTTP server**: `./gestalt serve` — a daemon that watches your development environment
-- **File watching**: Monitor file changes, test results, git status
-- **Proactive suggestions**: "Build failed because of the type change in line 47 — want me to fix the callers?"
-- **Dynamic tool registration**: Add new tools at runtime without recompiling
-- **JARVIS personality consistency**: Trained into the weights through Phase 5's online learning
-
-This is the phase where GESTALT stops being a tool you invoke and becomes an assistant that's aware of your work.
-
----
-
-## 22. GESTALT vs ChatGPT
-
-| Aspect | ChatGPT (GPT-4) | GESTALT V5 |
-|--------|-----------------|------------|
-| Parameters | ~1.8 trillion | ~50M (current), ~200M (target) |
-| Architecture | Mixture of Experts | Single unified transformer |
-| Vocabulary | ~100K tokens (BPE) | 459 tokens (concept-space BPE) |
-| Training data | Trillions of tokens | 21K curated pairs |
-| Memory | None (per-session) | Persistent SQLite + episodic |
-| Tool use | Function calling (text) | Real subprocess execution |
-| Planning | Implicit (in-context) | Explicit FSM-constrained |
-| Plan validity | Best effort | Guaranteed syntactically valid |
-| Personality | System prompt (fragile) | Trained into weights |
-| Training time | Months on thousands of GPUs | ~90 minutes on one GPU |
-| Cost to run | API pricing ($20/month+) | Free (local GPU) |
-| Customizability | Black box | Full (own every weight) |
-| Privacy | Data leaves your machine | Everything stays local |
-| Learning | Frozen after RLHF | Continuous online learning (Phase 5) |
-
-### What GESTALT Can't Do
-
-**General knowledge.** ChatGPT has read the internet. GESTALT has read 21K dialogue pairs. Ask it about the Franco-Prussian War and you'll get word salad.
-
-**Instruction following.** ChatGPT has been RLHF'd on millions of human preference comparisons. GESTALT has a 64-task curriculum. Complex, multi-step instructions with nuanced constraints are beyond its current capability.
-
-**Language quality.** ChatGPT generates fluid, coherent prose for paragraphs and pages. GESTALT generates ~10-15 coherent tokens before degrading. This is the capacity bottleneck — d=1024 should significantly improve this.
-
-**Multi-modal understanding.** ChatGPT can process images, audio, and video. GESTALT is text-only.
-
-### What GESTALT Can Do Better
-
-**Memory.** Across sessions. Across restarts. Across weeks. Tell it something once, it remembers forever (until FIFO eviction). ChatGPT starts from zero every conversation.
-
-**Local execution.** Real tools on your machine with timeout enforcement and safety levels. Not a sandboxed code interpreter — actual subprocess access to your files, your tools, your environment.
-
-**Plan validity.** Every plan is syntactically valid, guaranteed by a 17-state FSM. ChatGPT can generate malformed JSON function calls. GESTALT cannot generate an unparseable plan.
-
-**Transparency.** Inspect every weight, every attention pattern, every training step. When something goes wrong, you can trace the exact data flow and find the exact failure point. Try that with a 1.8T parameter model behind an API.
-
-**Cost.** Once trained, runs on your GPU for free. No API rate limits, no token pricing, no monthly subscription. The weights are yours.
-
-**Privacy.** Nothing leaves your machine. No telemetry, no data collection, no "we may use your conversations for training." Your code, your conversations, your data — all local.
-
-### The Philosophical Difference
-
-ChatGPT is a general-purpose oracle. You ask questions, it answers from its vast training data. It doesn't know you, doesn't learn from you, doesn't care what you did yesterday.
-
-GESTALT is a specialized partner. It knows your codebase, remembers your preferences, learns from your corrections, and operates on your machine with your tools. It's not as smart in general — but it's deeply integrated with your specific workflow.
-
-The analogy: ChatGPT is a world-class consultant you hire by the hour. GESTALT is a junior engineer who lives in your office, knows where every file is, and gets better at your specific problems every day.
-
----
-
-## 23. Design Philosophy
-
-### The Gestalt Principle
-
-The name says everything. A gestalt is "a whole that is greater than the sum of its parts." The brain, the memory, the planner, the executor — none of them work well alone. But together, sharing a common concept space, they become something more.
-
-This isn't just a marketing statement. It's an architectural constraint. Every component reads from the same concept_vec. Memory keys are concept_vecs. Decoder prefixes are projected concept_vecs. Policy inputs are concept_vecs. One representation, many uses.
-
-The alternative — separate models for each task — is easier to build but fundamentally limited. A separate planner can't benefit from the language model's understanding of tool names. A separate memory system can't leverage the encoder's concept space for retrieval. Separate systems can be individually excellent but collectively incoherent.
-
-### Language as Interface, Not Substrate
-
-In GESTALT, language is the INPUT and OUTPUT of the system, but not the INTERNAL representation. The concept_vec (512 floating-point numbers) is the reasoning substrate. Language comes in, gets compressed to a concept, decisions happen in concept space, and language comes out.
-
-This is fundamentally different from LLMs, where everything is language tokens all the way through. GPT-4 "thinks" in language — its internal representations are contextual token embeddings. GESTALT "thinks" in concept vectors — a compressed, learned representation that strips away the surface form of language.
-
-Why does this matter? Because concept vectors can be:
-- Compared (cosine similarity)
-- Stored and retrieved (memory)
-- Projected into different modalities (language, plans, policy decisions)
-- Computed in one forward pass (~6ms)
-
-Language tokens need to be processed sequentially, one by one. Concept vectors are computed all at once.
-
-### Memory-First Design
-
-V4's biggest mistake was training without memory and bolting it on later. V5's biggest design commitment is memory-first: every component is designed to work WITH memory from the start.
-
-This means:
-- The decoder has memory prefix slots from architecture definition
-- Training includes randomly sampled memory prefixes from epoch 0
-- The memory projector learns useful representations alongside everything else
-- Memory retrieval is baked into the inference pipeline, not an optional add-on
-
-The result: when we turn on persistent memory, the model is already trained to use it. No fine-tuning, no special adaptation, no "memory injection" hacks. The model was trained in a world where memories exist.
-
-### Fail Loudly, Not Silently
-
-GESTALT's bug history (44 documented failures) has a clear theme: the worst bugs are the silent ones. candle's RmsNorm silently killing gradients. The decoder silently ignoring the concept prefix. The training loop silently overfitting while loss looked healthy.
-
-The design response: make failures visible.
+The current concept encoder processes the full input sequence through
+transformer attention (O(N^2) in sequence length). For very long inputs,
+a Perceiver IO architecture would use a small fixed-size set of latent
+vectors that cross-attend to the input:
 
 ```
-- Gradient flow test: runs before first training, verifies every parameter gets gradients
-- Concept diversity check: monitors pairwise cosine similarity during training
-- Generation diagnostics: greedy decode every 5K steps to check coherence
-- Validation split: 10% of data reserved for overfitting detection
-- Early stopping: automatically halts when learning plateaus
+Input: (1, 1000, 512)       long input sequence
+Latents: (1, 16, 512)       fixed set of learned queries
+
+Cross-attention: latents attend to input
+  Q from latents (16 queries), K/V from input (1000 keys)
+  Cost: O(16 * 1000) instead of O(1000 * 1000)
 ```
 
-The philosophy: if something can fail silently, add a check. The 10 minutes spent writing a diagnostic saves 40+ hours of blind debugging (proven by M-032).
+This would make the encoder cost independent of input length -- important
+for scaling to multi-turn conversations where the context grows with each
+turn.
 
-### Own Every Weight
+### Planned: Fused Softmax Kernel
 
-GESTALT is built from scratch not for the challenge, but for the understanding. When the model generates "Step one: read the error message," we can trace exactly which attention heads contributed, which encoder layers were most active, which concept dimensions were highest, and which training examples most influenced the output.
+The current softmax implementation uses four separate CUDA kernel launches:
+max, subtract, exp, sum, divide. A fused CUDA kernel would combine these
+into a single launch, eliminating kernel launch overhead and intermediate
+memory allocations. For the small sequence lengths in GESTALT, kernel
+launch latency dominates actual computation time.
 
-This transparency is the foundation for Phase 5 (online learning) and Phase 6 (proactive intelligence). You can't improve what you can't measure. You can't measure what you can't inspect. You can't inspect a black box.
+### Planned: Online Micro-Training
 
----
+The long-term goal is for GESTALT to improve from every interaction:
 
-## 24. Glossary
+```
+After N successful interactions:
+  1. Collect (prompt, response, reward) tuples
+  2. Run 100-500 SFT steps on successful interactions
+  3. Optionally: GRPO on preferred vs rejected responses
+  4. Save updated checkpoint
+```
 
-**Attention** — Mechanism letting each position look at others and decide what to focus on. Each position computes Query (what I want), Key (what I offer), Value (what I carry). High Q-K match → more V influence.
+This turns the deployed model into a continually learning system -- the
+more you use it, the better it gets at YOUR specific tasks and preferences.
 
-**Autoregressive** — Generating one token at a time, each depending on all previous tokens. Like typing a sentence where each letter is predicted from all previous letters.
+### Phase Roadmap
 
-**BOS/EOS** — Begin/End Of Sequence. Special tokens marking start and end of text. BOS tells the decoder "start generating." EOS tells it "stop generating."
-
-**BPE (Byte Pair Encoding)** — Tokenization that learns to merge common byte pairs. "th" → one token. "the" → one token. Reduces sequence length while preserving information.
-
-**Causal transformer** — Transformer where each position only sees itself and earlier positions (can't peek at future tokens). This is essential for generation — you can't attend to words you haven't generated yet.
-
-**candle** — Rust-native tensor computation library by Hugging Face. Provides autograd and CUDA support. Young framework with some bugs (see M-032).
-
-**Concept vector** — 512-dimensional vector representing the compressed meaning of input text. The central representation in GESTALT. All downstream components read from this single representation.
-
-**Cosine similarity** — How similar two vectors are by direction. 1.0 = same direction (identical meaning). 0.0 = perpendicular (unrelated). -1.0 = opposite direction.
-
-**Cross-entropy loss** — How surprised the model is by the correct answer. -log(P(correct)). Low = correct, high = wrong. Minimizing cross-entropy = maximizing probability of correct predictions.
-
-**d_model** — Dimensionality of the transformer's hidden representations. Currently 512, targeting 1024. Higher = more capacity = better representations = more parameters to train.
-
-**Denoising** — Deliberately corrupting training data (replacing tokens with PAD) to force the model to attend to the concept prefix instead of relying on local context alone.
-
-**Dropout** — During training, randomly zero 10% of values in each layer. Forces redundancy, prevents over-reliance on single neurons, extends useful training life.
-
-**Early stopping** — Stop training when validation loss stops improving for `patience` consecutive checks. Prevents overfitting — training too long causes memorization.
-
-**Episodic memory** — Storing specific experiences (goal, response, success) for later retrieval. Like remembering "last time I asked about colors, the user said blue." Contrasts with semantic memory (abstract facts).
-
-**FIFO** — First In, First Out. Oldest item removed when container is full. Simple eviction policy for memory.
-
-**FSM (Finite State Machine)** — Fixed states with transition rules. Used to constrain plan generation so every plan is syntactically valid. 17 states in GESTALT's planner.
-
-**GELU** — Gaussian Error Linear Unit. Smooth activation function in the MLP. Lets some negative values through (unlike ReLU which blocks all negatives). More expressive.
-
-**Gradient accumulation** — Summing gradients across multiple micro-batches before updating weights. Allows large effective batch sizes with limited VRAM. Essential for d=1024 training.
-
-**GradStore** — candle's internal structure for storing gradients. Maps tensor IDs to gradient tensors. Created by `loss.backward()`, consumed by `optimizer.step()`.
-
-**Logits** — Raw unnormalized output scores before softmax converts them to probabilities. Higher logit = higher probability after softmax.
-
-**Mean pooling** — Average all non-padding positions to produce one vector. Used by ConceptEncoder to compress variable-length input into fixed-size concept_vec.
-
-**MHA (Multi-Head Attention)** — Multiple attention mechanisms in parallel, each with own Q/K/V projections. Each head can focus on different aspects of the input. GESTALT uses 8 heads.
-
-**Nucleus sampling** — See Top-P.
-
-**Overfitting** — When the model memorizes training data instead of learning general patterns. Detected by validation loss increasing while training loss decreases. Prevented by dropout, early stopping, and sufficient data.
-
-**RMSNorm** — Normalizes vectors by root-mean-square (not mean-centered like LayerNorm). Keeps values in a stable range through layers. Custom implementation in GESTALT due to candle-nn bug.
-
-**RoPE** — Rotary Position Embedding. Encodes position by rotating Q and K vectors. Lower dimensions rotate faster (local position), higher dimensions slower (global position). Generalizes to unseen sequence lengths.
-
-**Safetensors** — Safe file format for neural network weights. No arbitrary code execution (unlike pickle). Used for all checkpoint saves.
-
-**SFT (Supervised Fine-Tuning)** — Training on (input, correct output) pairs. The model sees the correct answer and adjusts weights to predict it. The primary training method for GESTALT.
-
-**Top-K** — Only consider the K most probable next tokens during generation. Prevents low-probability garbage from being sampled.
-
-**Top-P (nucleus sampling)** — Only consider tokens whose cumulative probability reaches P. Adapts candidate pool based on model confidence — narrow when confident, wide when uncertain.
-
-**VRAM** — Video RAM. GPU memory. All weights, gradients, optimizer states, and activations must fit here during training. 16GB on the RTX 5070 Ti.
-
-**Weight decay** — Slowly pulling all weights toward zero during training. Prevents extreme weight values that cause overfitting. Applied in AdamW optimizer.
+| Phase | Components | Status |
+|-------|-----------|--------|
+| 0 | Foundation: transformer, tokenizer, RoPE, causal mask | Complete |
+| 1 | Pipeline: brain, policy, planner, executor | Complete |
+| 2 | BPE tokenizer + Language model + Memory | Complete |
+| 2.5 | KV cache, YaRN RoPE, cross-attention memory, prefix decoupling | Complete |
+| 3 | ReAct loops + concept-space chain-of-thought | Planned |
+| 4 | Experience buffer + online micro-training | Planned |
+| 5 | Daemon mode + context monitoring + proactive suggestions | Planned |
+| 6 | JARVIS personality training + unified server | Planned |
 
 ---
 
-*Built with Rust, candle, and an unreasonable amount of determination.*
-*GESTALT WIRED-V5 — February 2026*
+## 13. Glossary
 
-*"The encoder was dead for twelve runs. We just didn't know how to listen."*
+**Attention:** The mechanism by which each position in a sequence gathers
+information from all other positions. Uses Query, Key, Value projections.
 
-*"val_loss 1.88 on 92K pairs sounds better than val_loss 1.9 on 21K pairs. It wasn't."*
+**Attention temperature:** A scaling factor applied to attention logits
+to compensate for entropy changes. In YaRN, equals sqrt(L_test / L_train)
+when extending beyond the training context window.
 
-*"After 2 failed experiments, stop and build a diagnostic. One diagnostic run > 30 blind experiments. Always."*
+**Autoregressive:** Generating one token at a time, where each token is
+conditioned on all previous tokens.
+
+**BOS (Beginning of Sequence):** Special token marking the start of text.
+
+**BPE (Byte Pair Encoding):** A tokenization method that merges frequent
+byte pairs into single tokens, compressing text.
+
+**Causal mask:** A triangular matrix that prevents future positions from
+being attended to, enforcing left-to-right generation.
+
+**candle-rs:** Hugging Face's Rust tensor library. Provides CUDA-accelerated
+tensor operations without PyTorch's dependency overhead.
+
+**Concept bottleneck:** The architectural constraint that forces all
+information through a fixed-size concept vector.
+
+**Concept vector:** The d_model-dimensional (e.g. 512) vector produced by
+the concept encoder. Summarizes the meaning of the input.
+
+**Cross-attention:** An attention mechanism where Q comes from one source
+(e.g. decoder hidden states) and K/V come from another (e.g. external
+memory). Used to inject information from a separate modality without
+concatenating it into the sequence.
+
+**Cross-entropy:** The loss function for classification and language
+modeling. Measures how far the model's predicted probabilities are from
+the correct answer.
+
+**d_ff:** Feed-forward intermediate dimension. Default: 2048 (4x d_model).
+
+**d_model:** The dimension of all hidden states in the transformer.
+Default: 512 (Phase 1) or 1024 (Phase 2).
+
+**Dropout:** Regularization technique that randomly zeros elements during
+training to prevent overfitting.
+
+**Early stopping:** Halting training when validation loss stops improving,
+to prevent overfitting.
+
+**Embedding:** A lookup table mapping discrete token IDs to dense vectors.
+
+**EOS (End of Sequence):** Special token marking the end of text.
+
+**Episodic memory:** Memory system that stores specific past experiences
+(concept vector + text) and retrieves them by similarity.
+
+**FIFO eviction:** First In, First Out. When memory is full, the oldest
+entry is removed.
+
+**FSM (Finite State Machine):** A formal model of computation with a
+finite set of states and transitions. Used to constrain the planner's
+output.
+
+**f32:** 32-bit floating point. The only precision supported by candle-rs
+v0.8.4 for training.
+
+**GELU:** Gaussian Error Linear Unit. A smooth activation function used
+in transformer MLPs.
+
+**Gradient accumulation:** Simulating larger batch sizes by accumulating
+gradients over multiple micro-batches before updating weights.
+
+**Head dimension:** The dimension of each attention head. Equals d_model
+divided by n_heads. Default: 64.
+
+**Intent:** The classified purpose of a user's goal (greet, search,
+run tests, etc.).
+
+**KV cache:** Cached Key and Value tensors from previous generation steps,
+enabling O(1) per-token generation instead of O(N).
+
+**Logits:** Raw (pre-softmax) scores output by the model. Each logit
+corresponds to one token in the vocabulary.
+
+**Mean pooling:** Averaging hidden states across the sequence dimension,
+excluding padding positions.
+
+**MLP (Multi-Layer Perceptron):** A feed-forward neural network with one
+hidden layer and a nonlinear activation. Used per-position in transformers.
+
+**n_heads:** Number of attention heads. Default: 8.
+
+**NTK (Neural Tangent Kernel) scaling:** A method of adjusting the RoPE
+frequency base to extend context length while preserving the relative
+spacing between frequency dimensions.
+
+**PAD:** Special padding token used to fill sequences to a fixed length.
+
+**Prefix tokens:** Concept and memory vectors that are prepended to the
+decoder's input sequence, providing conditioning context.
+
+**Right-padding:** Placing PAD tokens at the end of the sequence. Used for
+decoder sequences so BOS is always at position 0.
+
+**Left-padding:** Placing PAD tokens at the start of the sequence. Used for
+encoder sequences.
+
+**RmsNorm (Root Mean Square Layer Normalization):** Normalizes by dividing
+by the root mean square of the vector.
+
+**RoPE (Rotary Position Embeddings):** Positional encoding that rotates
+Q and K vectors, encoding relative positions through dot product properties.
+
+**RoPE prefix decoupling:** The design decision to exclude prefix tokens
+(concept projections) from RoPE rotation. Only text tokens receive
+positional encoding.
+
+**Safetensors:** A file format for storing neural network weights. Used by
+candle-nn for checkpoint saving and loading.
+
+**Softmax:** Converts a vector of real numbers into a probability
+distribution. `softmax(z)_i = exp(z_i) / sum(exp(z_j))`.
+
+**SFT (Supervised Fine-Tuning):** Training on (input, target) pairs where
+the correct output is known.
+
+**Temperature:** A parameter that controls the randomness of sampling.
+Lower = more deterministic, higher = more random.
+
+**Top-K:** A sampling strategy that considers only the K highest-probability
+tokens.
+
+**Top-P (nucleus sampling):** A sampling strategy that considers the smallest
+set of tokens whose cumulative probability exceeds P.
+
+**Transformer:** A neural network architecture based on self-attention,
+used as the building block for all components in GESTALT.
+
+**VarMap:** candle-nn's parameter container. Holds all trainable tensors
+(Vars) and provides access to the optimizer.
+
+**VRAM:** Video RAM. The GPU's dedicated memory. The RTX 5070 Ti has 16GB.
+
+**YaRN (Yet another RoPE extensioN):** A method for extending a model's
+effective context window beyond its training length by applying frequency-
+selective scaling to RoPE dimensions. High-frequency dimensions are left
+unchanged, low-frequency dimensions are NTK-scaled, and mid-frequency
+dimensions receive a linear interpolation between the two.
+
+---
+
+*This document describes the GESTALT WIRED-V5 system as of Phase 2.5,
+February 2026. Built on an RTX 5070 Ti with 16GB VRAM, running on
+WSL2 under Windows 11.*
