@@ -136,6 +136,7 @@ pub struct BrainConfig {
     pub early_stop_da: f32,      // DA early stop threshold
     pub early_stop_patience: usize,
     pub decoder_vocab_size: usize, // v17: decoder embedding table size (259=byte-level, 2259=concept tokens)
+    pub dropout: f64, // v20: dropout rate for decoder transformer (0.0 = disabled)
 }
 
 impl BrainConfig {
@@ -161,8 +162,9 @@ impl BrainConfig {
             max_noise_rate: 0.10,
             early_stop_sft: 0.0,  // v16: disabled — val loss + patience handles stopping
             early_stop_da: 5e-3,
-            early_stop_patience: 10, // v16: more patience for smoother convergence signal
+            early_stop_patience: 5, // v20: stricter early stopping (was 10)
             decoder_vocab_size: TALK_VOCAB_SIZE, // default: byte-level (override with ConceptTokenizer vocab)
+            dropout: 0.1, // v20: decoder dropout to prevent overfitting
         }
     }
 
@@ -199,6 +201,7 @@ impl BrainConfig {
             early_stop_da: 0.0,
             early_stop_patience: 3,
             decoder_vocab_size: TALK_VOCAB_SIZE,
+            dropout: 0.0, // no dropout in test mode (fast, deterministic)
         }
     }
 
@@ -228,6 +231,7 @@ impl BrainConfig {
             early_stop_da: 5e-3,
             early_stop_patience: 5,
             decoder_vocab_size: TALK_VOCAB_SIZE,
+            dropout: 0.1,
         }
     }
 
@@ -486,6 +490,7 @@ impl Brain {
             d_ff: config.d_ff,
             vocab_size: TALK_VOCAB_SIZE,
             max_seq_len: config.encoder_seq_len,
+            dropout: 0.0, // encoder is 1 layer, dropout not needed
         };
         let concept_encoder = WiredTransformer::from_vb(enc_cfg, vb.pp("enc"), device)?;
 
@@ -506,6 +511,7 @@ impl Brain {
             d_ff: config.d_ff,
             vocab_size: config.decoder_vocab_size,
             max_seq_len: config.total_decoder_seq(),
+            dropout: config.dropout,
         };
         let language_decoder = WiredTransformer::from_vb(dec_cfg, vb.pp("dec"), device)?;
 
@@ -519,6 +525,7 @@ impl Brain {
             d_ff: policy_cfg.d_ff,
             vocab_size: BYTE_VOCAB,
             max_seq_len: policy_cfg.seq_len,
+            dropout: 0.0, // policy doesn't need dropout (task is easier)
         };
         let policy_backbone = WiredTransformer::from_vb(pol_tcfg, vb.pp("pol_backbone"), device)?;
 
@@ -596,8 +603,19 @@ impl Brain {
         response_ids: &Tensor,
         memory_vecs: Option<&Tensor>,
     ) -> Result<Tensor> {
+        self.forward_from_concept_t(concept_vec, response_ids, memory_vecs, false)
+    }
+
+    /// Training variant with dropout enabled on the decoder.
+    pub fn forward_from_concept_t(
+        &self,
+        concept_vec: &Tensor,
+        response_ids: &Tensor,
+        memory_vecs: Option<&Tensor>,
+        train: bool,
+    ) -> Result<Tensor> {
         let prefix = self.build_prefix(concept_vec, memory_vecs)?;
-        self.language_decoder.forward_with_prefix(&prefix, response_ids)
+        self.language_decoder.forward_with_prefix_t(&prefix, response_ids, train)
     }
 
     pub fn forward_with_memory(
@@ -1029,7 +1047,7 @@ pub fn train_brain_talk(
             None
         };
 
-        let logits = brain.forward_from_concept(&concept_vec, &input_t, mem_tensor.as_ref())?;
+        let logits = brain.forward_from_concept_t(&concept_vec, &input_t, mem_tensor.as_ref(), true)?;
         let loss = weighted_cross_entropy(&logits, &target_t, 0.0, Some(&weight_t))?;
 
         // T-020: Store batch concept vectors in memory pool (detached from graph).
@@ -1052,7 +1070,9 @@ pub fn train_brain_talk(
 
         trainer.backward_step(&loss)?;
 
-        let log_interval = if total_steps > 5000 { 1000 } else { 500 };
+        let log_interval = std::env::var("GESTALT_LOG_EVERY")
+            .ok().and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(if total_steps > 5000 { 1000 } else { 500 });
         if step % log_interval == 0 || step == total_steps - 1 {
             let window = losses.len().min(10);
             let avg: f32 = losses.iter().rev().take(window).sum::<f32>() / window as f32;
@@ -1560,10 +1580,15 @@ fn brain_finetune_dialogue_aligned(
 // Generation
 // ---------------------------------------------------------------------------
 
-fn apply_repetition_penalty(logits: &mut [f32], generated: &[u32], penalty: f32) {
+fn apply_repetition_penalty(logits: &mut [f32], generated: &[u32], penalty: f32, window: usize) {
     if penalty <= 1.0 { return; }
+    let start = if window > 0 && generated.len() > window {
+        generated.len() - window
+    } else {
+        0
+    };
     let mut counts = std::collections::HashMap::<u32, u32>::new();
-    for &id in generated {
+    for &id in &generated[start..] {
         *counts.entry(id).or_insert(0) += 1;
     }
     for (&id, &count) in &counts {
@@ -1585,6 +1610,36 @@ fn apply_top_k(logits: &mut [f32], k: usize) {
     let threshold = indexed[k - 1].1;
     for l in logits.iter_mut() {
         if *l < threshold {
+            *l = f32::NEG_INFINITY;
+        }
+    }
+}
+
+fn apply_top_p(logits: &mut [f32], p: f32) {
+    if p >= 1.0 { return; }
+    let mut indexed: Vec<(usize, f32)> = logits.iter().enumerate()
+        .filter(|(_, &v)| v != f32::NEG_INFINITY)
+        .map(|(i, &v)| (i, v))
+        .collect();
+    // softmax to get probabilities
+    let max_val = indexed.iter().map(|(_, v)| *v).fold(f32::NEG_INFINITY, f32::max);
+    let exp_sum: f32 = indexed.iter().map(|(_, v)| (v - max_val).exp()).sum();
+    for item in indexed.iter_mut() {
+        item.1 = (item.1 - max_val).exp() / exp_sum;
+    }
+    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let mut cumsum = 0.0_f32;
+    let mut cutoff_idx = indexed.len();
+    for (i, &(_, prob)) in indexed.iter().enumerate() {
+        cumsum += prob;
+        if cumsum >= p {
+            cutoff_idx = i + 1;
+            break;
+        }
+    }
+    let kept: std::collections::HashSet<usize> = indexed[..cutoff_idx].iter().map(|(i, _)| *i).collect();
+    for (i, l) in logits.iter_mut().enumerate() {
+        if !kept.contains(&i) {
             *l = f32::NEG_INFINITY;
         }
     }
@@ -1629,7 +1684,9 @@ pub fn brain_generate(
 
     let mut generated: Vec<u32> = vec![TOK_BOS];
     let rep_penalty = 1.3_f32;
+    let rep_window = 50_usize;
     let top_k = 40_usize;
+    let top_p = 0.9_f32;
 
     for _ in 0..max_tokens {
         let padded = right_pad(&generated, dec_seq);
@@ -1640,8 +1697,9 @@ pub fn brain_generate(
         let read_pos = generated.len() - 1;
         let mut next_logits = logits.i((0, read_pos))?.to_vec1::<f32>()?;
 
-        apply_repetition_penalty(&mut next_logits, &generated, rep_penalty);
+        apply_repetition_penalty(&mut next_logits, &generated, rep_penalty, rep_window);
         apply_top_k(&mut next_logits, top_k);
+        apply_top_p(&mut next_logits, top_p);
 
         if (TOK_PAD as usize) < next_logits.len() {
             next_logits[TOK_PAD as usize] = f32::NEG_INFINITY;
@@ -2019,6 +2077,7 @@ pub fn train_and_bench(cfg: &PolicyConfig, device: &Device) -> Result<(usize, us
         d_ff: cfg.d_ff,
         vocab_size: BYTE_VOCAB,
         max_seq_len: cfg.seq_len,
+        dropout: 0.0,
     };
     let backbone = WiredTransformer::from_vb(tcfg, vb.pp("backbone"), device)?;
 
@@ -2379,6 +2438,7 @@ mod tests {
             d_ff: cfg.d_ff,
             vocab_size: BYTE_VOCAB,
             max_seq_len: cfg.seq_len,
+            dropout: 0.0,
         };
         let backbone = WiredTransformer::from_vb(tcfg, vb.pp("backbone"), &device)?;
 
