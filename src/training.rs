@@ -1,5 +1,6 @@
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
+use candle_core::backprop::GradStore;
 use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarMap};
 use std::process::Command;
 use std::time::Instant;
@@ -50,6 +51,10 @@ impl CosineScheduler {
     pub fn current_step(&self) -> usize {
         self.current_step
     }
+
+    pub fn set_step(&mut self, step: usize) {
+        self.current_step = step;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -92,6 +97,7 @@ pub struct Trainer {
     pub scheduler: CosineScheduler,
     pub config: TrainingConfig,
     pub varmap: VarMap,
+    accum_grads: Option<GradStore>,
     accum_count: usize,
     step_count: usize,
     timer_start: Instant,
@@ -117,21 +123,69 @@ impl Trainer {
             scheduler,
             config,
             varmap,
+            accum_grads: None,
             accum_count: 0,
             step_count: 0,
             timer_start: Instant::now(),
         })
     }
 
-    /// Accumulate a loss. Returns Some(step_number) when optimizer actually steps.
-    pub fn accumulate_and_step(&mut self, loss: &Tensor) -> Result<Option<usize>> {
-        let scale = 1.0 / self.config.grad_accum_steps as f64;
-        let scaled_loss = (loss * scale)?;
+    /// Resume training from a given step. Sets both the step counter and scheduler
+    /// position so the LR schedule continues from where it left off.
+    /// Note: optimizer momentum (AdamW m/v) is NOT restored — it rebuilds naturally
+    /// in ~1K steps. This is acceptable for the minimal resume fix.
+    pub fn resume_from_step(&mut self, step: usize) {
+        self.step_count = step;
+        self.scheduler.set_step(step);
+        let lr = self.scheduler.get_lr();
+        self.optimizer.set_learning_rate(lr);
+        eprintln!(
+            "[RESUME] Restored trainer to step {}, lr={:.2e}",
+            step, lr
+        );
+    }
 
-        self.optimizer.backward_step(&scaled_loss)?;
+    /// Accumulate gradients from a micro-batch loss. Properly accumulates gradient
+    /// tensors across micro-batches and only steps the optimizer when all micro-batches
+    /// are processed. Returns Some(step_number) when an optimizer step occurs.
+    ///
+    /// The loss is scaled by 1/N internally so accumulated gradients are averaged.
+    pub fn accumulate_and_step(&mut self, loss: &Tensor) -> Result<Option<usize>> {
+        // Scale loss by 1/N so gradients are averaged across micro-batches
+        let scaled = if self.config.grad_accum_steps > 1 {
+            (loss / self.config.grad_accum_steps as f64)?
+        } else {
+            loss.clone()
+        };
+        let grads = scaled.backward()?;
+
+        // Accumulate gradients into stored GradStore
+        match &mut self.accum_grads {
+            None => {
+                self.accum_grads = Some(grads);
+            }
+            Some(accum) => {
+                for var in self.varmap.all_vars() {
+                    let t = var.as_tensor();
+                    if let Some(new_g) = grads.get(t) {
+                        let sum = if let Some(existing) = accum.get(t) {
+                            (existing + new_g)?
+                        } else {
+                            new_g.clone()
+                        };
+                        accum.insert(t, sum);
+                    }
+                }
+            }
+        }
+
         self.accum_count += 1;
 
         if self.accum_count >= self.config.grad_accum_steps {
+            // Step optimizer with accumulated (averaged) gradients
+            if let Some(grads) = self.accum_grads.take() {
+                self.optimizer.step(&grads)?;
+            }
             self.accum_count = 0;
             self.step_count += 1;
             let new_lr = self.scheduler.step();
@@ -238,6 +292,10 @@ impl EarlyStopping {
                     eprintln!("[BEST] Warning: failed to save best checkpoint: {e}");
                 } else {
                     eprintln!("[BEST] New best loss={avg_loss:.6} at step {step} -> {path}");
+                    // Write machine-readable state file for external monitoring
+                    let state_path = path.replace(".safetensors", "_state.txt");
+                    let _ = std::fs::write(&state_path,
+                        format!("{avg_loss:.6} {step}\n"));
                 }
             }
             action = EarlyStopAction::NewBest;
@@ -345,7 +403,7 @@ pub fn one_hot_tensor(indices: &Tensor, num_classes: usize, device: &Device) -> 
 
 pub fn save_checkpoint(varmap: &VarMap, path: &str) -> Result<()> {
     let tensors = varmap.all_vars();
-    let data = varmap.data().lock().unwrap();
+    let data = varmap.data().lock().expect("VarMap mutex poisoned");
     let named: std::collections::HashMap<String, Tensor> = data
         .iter()
         .map(|(name, var)| (name.clone(), var.as_tensor().clone()))
@@ -357,7 +415,7 @@ pub fn save_checkpoint(varmap: &VarMap, path: &str) -> Result<()> {
 
 pub fn load_checkpoint(varmap: &VarMap, path: &str, device: &Device) -> Result<()> {
     let tensors = candle_core::safetensors::load(path, device)?;
-    let data = varmap.data().lock().unwrap();
+    let data = varmap.data().lock().expect("VarMap mutex poisoned");
     let mut loaded = 0usize;
     for (name, var) in data.iter() {
         if let Some(saved_tensor) = tensors.get(name) {

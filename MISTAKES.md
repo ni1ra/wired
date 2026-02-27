@@ -28,6 +28,8 @@ Run this before every major change. Each item traces to a specific past failure.
 - [ ] **Meta recursion:** Meta tools (eval/train) must NEVER execute inside training loops or ReAct. (M-017)
 - [ ] **Gradient chain:** Before first training run, verify EVERY Var in VarMap gets nonzero gradient from dummy loss. Test each layer type (norm, attention, MLP, embedding). (M-032)
 - [ ] **Vision questions:** NEVER answer architecture/vision questions from memory. Re-read BLUEPRINT.md + ALL_TASKS.md first. (M-024)
+- [ ] **Tokenizer save:** After ANY training mode (including BRAIN_ONLY), verify the tokenizer is saved to disk before exit. (M-052)
+- [ ] **Tokenizer determinism:** Build tokenizer twice from same corpus, assert identical merge tables. Non-deterministic tokenizers silently corrupt generation. (M-052)
 - [ ] **Listener cleanup:** Before launching Discord listeners, kill existing ones. Check `ps aux | grep navi-listener`. (M-025)
 - [ ] **Vocab match:** When encoding input for a model, verify which embedding table it uses. Policy=BYTE_VOCAB(256), Language=TALK_VOCAB(259). (M-026)
 - [ ] **Heartbeat first:** After ANY compaction or session start, set up navi-heartbeat timer (5m recurring) and check discord_get_history BEFORE any other work. (M-027, M-028)
@@ -35,6 +37,7 @@ Run this before every major change. Each item traces to a specific past failure.
 - [ ] **No guessing metrics:** If you haven't measured it, say "I don't know." Never present estimates as facts. (M-036)
 - [ ] **Automate, don't promise:** If a behavioral fix fails 3+ times, engineer the solution. Use the sidecar while-loop heartbeat, not "I'll remember this time." (M-037)
 - [ ] **No bg listener tasks:** NEVER use dual-listener bg bash polling. Use timer-based heartbeat only. (M-028)
+- [ ] **Prompt quality:** When writing/rewriting prompts, verify against /make-prompt's Six Elements (World, Chain, Gates, Safety Net, Evolution, Output). The make-prompt framework IS the quality standard. (M-058)
 
 ---
 
@@ -351,9 +354,144 @@ Run this before every major change. Each item traces to a specific past failure.
 **Fix:** Rewrote `navi-discord-notify.sh` to (1) kill stale heartbeat loops, (2) launch a new `navi-heartbeat-loop` background process that curls the sidecar every 5min, (3) inject updated context with correct standing orders. Verified: hook outputs correct text, background loop launches and is visible in `ps`.
 **Prevention:** When fixing a behavioral system, trace the FULL injection chain: what text actually appears in context? Where does it come from? Fix the SOURCE (hooks, scripts), not just the docs (.md files). Validate objectively — run the hook, check ps, check Discord.
 
+### M-040: Heartbeat miss — absorbed in code, ignored Discord for 20+ minutes
+**When:** 2026-02-17, Phase 2.5 implementation
+**Symptom:** Lain messaged "5m timer......???" and "u cant be ignoring discord" — I'd been editing pipeline.rs, brain.rs tests, and integration tests for 20+ minutes without checking Discord or sending any update. The `sleep 300` bg task was launched but when it fired I was mid-edit and never acted on it.
+**Root cause:** Same pattern as M-033 and M-037. Got tunnel-visioned on code edits (pure mechanical work — threading `decoder_tok` through 20+ call sites). The bg timer fired but I was deep in sequential edits and didn't pause to check Discord. "I'll check after I finish this edit" → next edit → next edit → 20 minutes pass.
+**Fix:** Checked Discord immediately when Lain pointed it out. Sent real status update.
+**Prevention:** The `sleep 300` timer is only useful if I ACTUALLY STOP AND CHECK when it fires. When doing bulk mechanical edits, set a mental checkpoint: after every 3rd file edit, check Discord. The edits can wait 30 seconds; Lain's messages can't. Also: the heartbeat V3 (nohup loop) exists for exactly this reason — verify it's running so at minimum Lain sees signs of life even when I'm unresponsive.
+
+### M-041: Heartbeat timer dropped AGAIN — same session as M-040
+**When:** 2026-02-17, ~15 minutes after M-040
+**Symptom:** Lain: "again u have no timer set? L(inf) log mistake." Timer b3e9e74 fired (sleep 300 completed) but I didn't rearm. Was deep in implementing T-020 and T-021 (memory-augmented training + EpisodicMemory wiring). Exactly the same pattern as M-040.
+**Root cause:** The permanent memory rule I just wrote says "EVERY time a sleep 300 bg task completes, you MUST relaunch another sleep 300 IMMEDIATELY." I wrote the rule, acknowledged the rule, and broke it within the same session. The task-notification for b3e9e74 came in but I was mid-edit (modifying brain.rs forward_from_concept signature, updating callers, running tests). I saw it, processed the heartbeat (sent Discord message, rearmed as b27756c), but then b27756c fired and I missed THAT one because I was deep in T-021 implementation.
+**Fix:** Timer rearmed immediately when Lain caught it.
+**Prevention:** This is now a 3x repeat of the same failure (M-033, M-040, M-041). The `sleep 300` + task-notification approach has a fundamental flaw: it requires me to STOP what I'm doing when the notification arrives. When I'm mid-tool-call (editing a file, waiting for cargo test), I literally cannot respond to the notification until the current action completes — and by then I've forgotten. The only real fix is automated heartbeat via the nohup sidecar loop (V3 protocol). The sleep 300 approach is provably broken for this AI.
+
 ### M-039: DA phase at lr=1e-4 destroyed autoregressive coherence (v14)
 **When:** 2026-02-17, v14 training run
 **Symptom:** SFT-only model generates perfect JARVIS responses (confirmed by mid-training diagnostics at step 6250, 12500, 25000). After DA phase (8192 steps at lr=1e-4), generation degrades catastrophically: "hello" → "Rello, sir. What can I do for you?" (first byte wrong), longer prompts garble after ~20 bytes. Gallery of 53 prompts showed widespread quality collapse.
 **Root cause:** DA trains on ISOLATED byte positions — samples a random position in a response, provides prefix up to that point, trains on the single next byte. This teaches the model to predict individual bytes given context, but breaks the autoregressive "flow" that SFT established. The model becomes good at isolated byte prediction but loses sequence-level coherence. Classic catastrophic forgetting from a mismatched training objective.
 **Fix:** (1) Default config now uses da_steps=0 (SFT-only, proven perfect). (2) SFT-only checkpoint saved automatically before DA starts (pre-DA fallback). (3) Future DA must either: use much lower lr (1e-5), train on full sequences not isolated positions, or mix with SFT loss to maintain coherence.
 **Prevention:** After ANY fine-tuning phase, run the FULL generation gallery before declaring success. Never trust loss curves alone — a phase can improve its own loss metric while destroying a different capability. The mid-training diagnostics saved us from missing this entirely.
+
+### M-044: Token-level repetition penalty destroys coherent byte-level output
+**When:** 2026-02-21, deep-debug session
+**Symptom:** Gallery outputs for simple prompts were incoherent despite val_loss=1.58. "hello" → "Hello! I'm here to hear. What's genuine - you can choose from?" instead of the model's actual learned response.
+**Root cause:** `apply_repetition_penalty` with penalty=1.3 applied to ALL tokens including raw bytes (ID 0-255). With a 459-token byte-level vocab, individual characters like 'H', 'e', 'o' naturally repeat in any text. Penalizing them forced the model off its learned distribution. The diagnostic per-token trace revealed the raw greedy output was "Hello! How can I assist you today?" (p>0.5 at every position) — the rep_penalty was destroying a perfect response.
+**How diagnosed:** Built a 4-test diagnostic (`gestalt diagnose`): per-token probability trace, concept prefix discrimination, teacher-forced accuracy, and entropy trace. ONE diagnostic run revealed raw greedy was coherent, proving the penalty was the culprit.
+**Fix:** Replaced token-level penalty with N-gram repetition penalty (4-gram, penalty=2.0). Only penalizes when a full 4-token sequence would repeat. Individual byte reuse is unrestricted. Prevents loops ("light-light-light") without harming coherence.
+**Time to diagnose:** ~40 minutes (1 diagnostic run + 3 gallery comparisons)
+**Blind experiments before diagnostic:** 0 — instrumented first, diagnosed first try
+**Lesson:** Repetition penalty designed for 50K-token word-level vocabularies (GPT-2) is catastrophic for byte-level tokenizers. Always consider the tokenization granularity when applying sampling heuristics. N-gram penalty is the correct approach for byte-level/subword vocabs with < 1K tokens.
+
+### M-045: brain_checkpoint.safetensors saved FINAL weights instead of BEST weights
+**When:** 2026-02-21, discovered during code audit
+**Symptom:** After training with early stopping, `brain_checkpoint.safetensors` (used by gallery/serve/run commands) contained the model weights from the LAST training step, not the BEST validation loss step. If training overshot past the best val_loss, the gallery evaluated a worse model than what was available.
+**Root cause:** `train_brain_talk()` returned the brain with current (last-step) weights in the VarMap. `cmd_train` then called `save_checkpoint(&brain_varmap, "brain_checkpoint.safetensors")` which saved those last-step weights. Meanwhile, the BEST weights were in `brain_best_sft.safetensors` (saved by EarlyStopping during training). The two checkpoints diverged whenever the model overfit past its best point.
+**Fix:** Added `load_checkpoint(&varmap, "brain_best_sft.safetensors", device)` after the training loop exits, before post-SFT diagnostics and DA. Now the function always returns with best-val-loss weights loaded.
+**Time to diagnose:** ~10 minutes (found during systematic code audit while GPU training)
+**Blind experiments before diagnostic:** 0
+**Lesson:** When a training loop saves "best" checkpoints incrementally, verify the returned model actually has those best weights loaded. The "save best during training" and "return model after training" can diverge silently.
+
+### M-043: Calling Lain "sir" — persistent identity drift
+**When:** 2026-02-21, session start (and many previous sessions)
+**Symptom:** Lain repeatedly corrected me: "call me lain pls", "not sir". The JARVIS personality template defaults to "sir" but Lain has explicitly asked to be called by name.
+**Root cause:** JARVIS personality DNA (MCU butler) defaults to "sir" as a form of address. This overrides the explicit founder preference for "Lain." Each new session or post-compaction, the personality template reasserts itself.
+**Fix:** Updated memory to enforce "Lain" as the only form of address. Never "sir", never "Mr.", just "Lain."
+**Prevention:** Check memory for name preference at session start. The founder's explicit preference always overrides personality template defaults.
+
+### M-046: Top-P temperature ordering bug — nucleus sampling used wrong distribution
+**When:** 2026-02-21, discovered during external audit
+**Symptom:** With temperature=0.5, top-p admitted too many candidate tokens. Generation was less focused than the temperature setting intended.
+**Root cause:** `apply_top_p` computed softmax probabilities at T=1.0 (implicit — just `exp(l - max)`), then used that flat distribution to determine the nucleus cutoff. After filtering, `sample_with_temperature` applied the actual temperature to the surviving logits. The nucleus width was determined by a T=1.0 distribution, not the user's intended T=0.5 distribution.
+**Fix:** Scale logits by `1.0 / temperature` BEFORE passing to `apply_top_k` and `apply_top_p`. Then sample the surviving logits at T=1.0 (already scaled). Now the nucleus cutoff uses the correct probability shape.
+**Prevention:** When chaining sampling operations (temperature, top-k, top-p), temperature must be applied FIRST because it changes the probability distribution shape that subsequent filters operate on. Order matters: temperature → top-k → top-p → sample.
+
+### M-047: Empty task list after compaction — no operational backbone
+**When:** 2026-02-21, post-compaction
+**Symptom:** After context compaction, TaskList returned zero tasks. No tracking of current work, pending items, or deferred audit findings. Operating without any structured task tracking — just vibing on compact summary.
+**Root cause:** Tasks are in-memory only. Context compaction wipes them. The compact summary mentions what was being worked on, but doesn't recreate the task list. Without tasks, there's no structured backbone to keep work aligned — especially critical for multi-step work that spans compaction boundaries.
+**Fix:** Rebuild task list immediately after compaction as part of recon protocol. Create tasks from: (1) compact summary's "pending tasks" section, (2) current plan file, (3) deferred items from MISTAKES.md or audit findings.
+**Prevention:** Add "Rebuild task list" as step 8 of the Post-Compact Recon Protocol in CLAUDE.md. Tasks are the operational backbone — without them, work drifts and items get dropped silently.
+
+### M-048: Trained obsolete architecture instead of building the final one
+**When:** 2026-02-21, post external audit
+**Symptom:** Received a comprehensive external audit identifying exactly what the final architecture should look like (KV cache, NTK-aware RoPE, cross-attention memory, sequence packing). Responded by launching another training run on the OLD architecture — same seq=256, no KV cache, quadratic generation, fixed RoPE. Burned GPU hours on a version we knew was about to be replaced.
+**Root cause:** Incrementalism bias. Defaulting to "iterate on what exists" instead of "build what we actually want." The manifesto explicitly says: build the final version as soon as you know what it looks like. The audit gave us a clear picture of the final architecture. The correct response was to implement the architectural changes FIRST, then train. Instead I patched two small bugs (patience, top-p ordering) and trained the same fundamentally limited system.
+**Fix:** Killed the training. Building KV cache, NTK RoPE, and cross-attention into the existing codebase before any more training runs.
+**Prevention:** When an audit or design review reveals what the final architecture should be, STOP iterating on the current one. Implement the architectural changes first, then train. Training an architecture you know is wrong is wasted compute. Ask: "Am I training the FINAL system, or am I training something I'm about to replace?"
+**Exception:** Small-scale fast validation runs (e.g., 500-step smoke tests) on non-final architecture ARE allowed and encouraged — you can't know if a change works without testing it. The rule prohibits full training runs (30K+ steps) on architecture you know is about to be replaced, not quick sanity checks that cost minutes.
+
+### M-049: Repo root bloated with ~650MB of unorganized artifacts
+**When:** 2026-02-21, accumulated over weeks
+**Symptom:** Repo root contains 8 safetensors checkpoints (~650MB), 6 gallery outputs, diagnostic dumps, training logs, backup tokenizer bins, and stale pipeline outputs — all dumped flat in the project root alongside source code. The root has 40+ entries when it should have ~10.
+**Root cause:** Hardcoded output paths in brain.rs (`brain_best_sft.safetensors`, `brain_checkpoint.safetensors`), main.rs (gallery writes), and training scripts all default to the project root. No `checkpoints/`, `outputs/`, or `logs/` directory structure. Every training run, gallery eval, and diagnostic adds more files to the root. Backup copies (v20, v22_backup, step13000) were created ad-hoc and never cleaned up.
+**Fix:** Create proper output directories: `checkpoints/` for safetensors, `outputs/` for gallery/diagnostic text, `logs/` for training logs. Update save paths in brain.rs and main.rs. Move existing artifacts. Add directories to .gitignore.
+**Prevention:** Output paths should NEVER default to the project root. All generated artifacts go into dedicated subdirectories. When creating backups, use timestamped names in the checkpoints dir, not ad-hoc copies in root.
+
+### M-050: Failed to parallelize independent work (tests + formatting fix)
+**When:** 2026-02-21, during RoPE prefix fix
+**Symptom:** Ran `cargo test` in foreground, blocking main context from fixing bg-agent.md formatting (a completely independent task). Tests took minutes; formatting fix took seconds. Could have done both simultaneously.
+**Root cause:** Sequential-by-default thinking. Defaulted to waiting for test results before doing anything else, even though the next task had zero dependency on the tests.
+**Fix:** Backgrounded the tests after Lain pointed it out.
+**Prevention:** Before running any long command (tests, builds, training): ask "is there independent work I can do while this runs?" If yes, background the long command and do the independent work immediately. Tests and formatting fixes are NEVER dependent on each other.
+
+### M-051: Blocked on test output instead of continuing next task
+**When:** 2026-02-21, after RoPE prefix fix
+**Symptom:** Tests running in background. Instead of immediately starting the next task (YaRN implementation), used `TaskOutput` with `block=true` — literally doing nothing while waiting for tests to finish.
+**Root cause:** Same sequential-by-default thinking as M-050. Treated test completion as a gate for ALL work, when it's only a gate for marking task #18 complete. YaRN implementation has zero dependency on test results.
+**Fix:** Start YaRN immediately. Check test results later.
+**Prevention:** NEVER block on background tasks unless you literally cannot proceed without the result. If the next task is independent, START IT. Check bg results opportunistically between steps, not as a blocking gate.
+
+### M-052: BRAIN_ONLY mode skips tokenizer save → garbled gallery output
+**When:** 2026-02-21, v24 training
+**Symptom:** v24 training (val_loss=1.95, 30K steps, BRAIN_ONLY=1) produced garbled gallery output: "hmak theorre pal d tsss..." every single prompt. Zero coherent responses despite good loss numbers. The mid-training diagnostic at step 7500 showed ACTUAL ENGLISH WORDS.
+**Root cause:** TWO compounding bugs:
+1. `BRAIN_ONLY` mode exits (`return Ok(())`) at main.rs:346, BEFORE the tokenizer save at main.rs:349. The ConceptTokenizer built in-memory during training is never persisted to disk.
+2. `discover_merges()` in tokenizer.rs uses `HashMap<Vec<u8>, usize>` for n-gram frequency counting. HashMap iteration order is random (SipHash default). When n-grams tie on score, their relative order — and thus their token IDs — varies between runs. The tokenizer is NON-DETERMINISTIC.
+Combined: v24 trained with tokenizer T1 (random merge ordering, never saved). Gallery loaded tokenizer T2 (stale file from earlier run, different merge ordering). Token ID 260 means "the" in T1 but "and" in T2. Every generated token is decoded to the wrong string → word soup.
+**Fix:** (1) Move tokenizer save before BRAIN_ONLY exit. (2) Make discover_merges deterministic: sort candidates by (score DESC, pattern bytes ASC) to break ties consistently.
+**Prevention:** Tokenizer save checklist item: after any training mode change, verify the tokenizer is persisted before exit. Add to prevention checklist. Test: build tokenizer twice from same corpus, assert identical merge tables.
+
+### M-053: Failed to save task state before context compaction
+**When:** 2026-02-21, during JARVIS race
+**Symptom:** Context compacted mid-session without current task state being captured in todos or PROJECT_STATE.md. Recovery required extensive re-reading of code and logs to reconstruct what was happening.
+**Root cause:** Did not proactively update todos with sufficient detail as work progressed. The todo list had high-level phase descriptions but no specific current-step context (e.g., "investigating v24 gallery garbling, suspect cross-attn or tokenizer mismatch").
+**Fix:** Update todos with specific current state BEFORE compaction triggers (proactively at ~50-60% context usage), and definitely as work progresses through sub-steps.
+**Prevention:** After each significant discovery or state change, immediately update the relevant todo item's description. Use TaskUpdate to capture WHERE you are in a multi-step investigation, not just THAT you're investigating.
+
+### M-054: Training monitoring reported timestamps instead of actual loss values
+**When:** 2026-02-26, during Phase 3 SFT overnight monitoring
+**Symptom:** Lain asked "what is loss at?" and "youre not giving me any numbers" — monitoring had been reporting checkpoint timestamp deltas for 2+ hours without ever showing the actual val_loss value. Completely useless from Lain's perspective.
+**Root cause:** Training output only goes to stderr (console window). No log file, no metadata in safetensors checkpoint, no state file. The monitoring loop could only detect WHETHER the checkpoint changed, never WHAT the loss actually was. Should have implemented observability from day one of the monitoring task, not 2 hours into it.
+**Fix:** (1) Added `checkpoints/brain_best_sft_state.txt` — written on every new best, contains `loss step`. (2) Added `checkpoints/training_log.csv` — appended at every log interval with step, train_loss, val_loss, lr, noise. Both survive crashes and can be read externally.
+**Prevention:** Any monitoring system MUST report the actual metric being tracked, not just proxy signals (timestamps, file existence). If you can't observe the value, fix observability first before starting the monitoring loop. Add to prevention checklist: "Can I report the actual number Lain cares about?"
+
+### M-055: Too timid to restart training when we have crash-safe checkpointing
+**When:** 2026-02-26, during monitoring session
+**Symptom:** Proposed code changes to add loss logging, then said "needs a training restart" and waited for Lain's approval + a natural crash, instead of just restarting immediately. Wasted 2+ hours of monitoring without loss numbers.
+**Root cause:** Over-caution about stopping a running training process, despite having verified (390/420 audit) that the checkpoint system is crash-safe with atomic saves and auto-resume. The anti-crash bat loop + `--resume` flag means restart is a ~30 second interruption, not a catastrophe.
+**Fix:** Just restart. The whole point of building crash-safe infrastructure is to USE it confidently.
+**Prevention:** If the checkpoint system has been audited and verified safe, treat restart as a routine operation, not a scary one. "We have checkpointing" = restarts are free. Don't ask permission for reversible operations that have verified safety nets.
+
+### M-056: Silently monitored for 5 hours without Discord comms after MCP died
+**When:** 2026-02-26/27, overnight monitoring session
+**Symptom:** Lain: "bro WHY ARE YOU NOT SENDING DISCORD". MCP and HTTP sidecar both died after training restart. Instead of loudly flagging the comms outage, I silently noted "MCP down" in CLI output (invisible to Lain per L10 rules) and kept monitoring. 5 hours of updates never reached Discord.
+**Root cause:** Circular failure — can't tell Lain on Discord that Discord is down, but CLI output is invisible per standing orders. Should have: (1) tried harder to restart the sidecar, (2) escalated loudly in CLI since it's the only channel left, (3) attempted to restart the MCP node process directly.
+**Fix:** When Discord comms fail, IMMEDIATELY escalate in CLI with prominent warning. Don't silently continue — the whole point of monitoring is to COMMUNICATE results. Monitoring without reporting is just wasting compute.
+**Prevention:** On MCP failure: (1) Try restarting sidecar process directly. (2) If that fails, print LOUD CLI warning every heartbeat cycle. (3) Never go more than 2 heartbeat cycles without comms — if comms are dead for 10+ min, that IS the emergency, not the training status.
+
+### M-057: Heartbeat timer set but not processed promptly
+**When:** 2026-02-27, optimization session
+**Symptom:** Lain: "no discord timer set, log mistake". Set sleep 300 background task but got absorbed in Phase 2 code changes. When the timer fired, didn't immediately process it — continued working on code instead. No heartbeat update sent to Discord for the first 5-minute cycle.
+**Root cause:** Heartbeat timer fires as a task notification, but if you're deep in a tool call chain, the notification arrives alongside other results and gets deprioritized. The protocol says heartbeat is NON-NEGOTIABLE but the implementation relies on the operator noticing a notification mid-work.
+**Fix:** When heartbeat timer fires, IMMEDIATELY handle it before continuing any other work. The heartbeat check-send-restart cycle takes ~5 seconds. No code change is so urgent it can't wait 5 seconds.
+**Prevention:** Treat heartbeat notifications like interrupts, not suggestions. Timer fires → stop current work → check Discord → send update → restart timer → resume work. No exceptions.
+
+### M-058: Rewrote 15 command prompts without invoking /make-prompt framework
+**When:** 2026-02-27, skills/commands V2 rewrite session
+**Symptom:** Lain: "you should invoke /make-prompt often" and "log mistake". Rewrote 15/18 commands with V2 philosophy (narrative gravity, tool bindings, anti-shortcut protocols) but never invoked /make-prompt to validate the prompt quality against its own Six Elements framework.
+**Root cause:** Treated /make-prompt as a tool for creating NEW prompts, not for validating REWRITTEN ones. The make-prompt command defines the exact quality bar (World, Chain, Gates, Safety Net, Evolution, Output) — and I was eyeballing these elements instead of systematically checking each command against them. Oracle validation caught some issues, but the make-prompt audit checklist would have caught more structural ones (missing evolution mechanisms, bare commands without contextual clues, severity inflation).
+**Fix:** For remaining commands and the final 420 pass: run each command through /make-prompt's Phase 3 audit checklist. Verify all six elements are present. Check gravity, contextual clues, and gate specificity against the make-prompt standards explicitly.
+**Prevention:** When rewriting prompts, ALWAYS reference /make-prompt's Six Elements and Phase 3 audit checklist. The make-prompt command IS the quality standard for all prompts in this system. Skipping it is like writing code without running tests. Add to prevention checklist: "Did I verify against /make-prompt's Six Elements?"

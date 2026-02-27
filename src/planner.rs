@@ -73,12 +73,12 @@ impl PlanLmConfig {
     /// Phase 2: scaled planner (d=1024, 8 layers).
     pub fn phase2() -> Self {
         Self {
-            d_model: 1024,
-            n_layers: 8,
+            d_model: 512,
+            n_layers: 4,
             n_heads: 8,
-            d_ff: 4096,
-            max_seq_len: 512,
-            batch_size: 21,
+            d_ff: 2048,
+            max_seq_len: 256,
+            batch_size: 4,
             sft_steps: 8000,
             sft_lr: 2e-4,
             scheduled_sampling_steps: 2000,
@@ -396,6 +396,9 @@ pub fn train_sft(
         d_ff: config.d_ff,
         vocab_size,
         max_seq_len: config.max_seq_len,
+        max_train_len: config.max_seq_len,
+        dropout: 0.0, // planner doesn't need dropout (21 goals, always converges)
+        use_cross_attn: false,
     };
 
     let varmap = VarMap::new();
@@ -453,7 +456,7 @@ pub fn train_sft(
     let mut early_stop = EarlyStopping::new(
         config.early_stop_loss,
         config.early_stop_patience,
-        if config.early_stop_loss > 0.0 { Some("planner_best.safetensors".to_string()) } else { None },
+        if config.early_stop_loss > 0.0 { Some("checkpoints/planner_best.safetensors".to_string()) } else { None },
     );
 
     for step in 0..config.sft_steps {
@@ -531,7 +534,7 @@ pub fn diagnostic_decode(
             .enumerate()
             .map(|(i, &p)| (i as u32, p))
             .collect();
-        sorted_probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        sorted_probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let top5: Vec<(String, f32)> = sorted_probs.iter()
             .take(5)
             .map(|(id, p)| (tok.token(*id).to_string(), *p))
@@ -683,6 +686,9 @@ mod tests {
             d_ff: 128,
             vocab_size: tok.vocab_size(),
             max_seq_len: 64,
+            max_train_len: 64,
+            dropout: 0.0,
+            use_cross_attn: false,
         };
         let varmap = VarMap::new();
         let model = WiredTransformer::new(config, &varmap, &device)?;

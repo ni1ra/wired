@@ -1,14 +1,19 @@
 # Build artifacts
 /target
 
-# Model checkpoints (large binary files)
+# Model checkpoints and outputs (organized in subdirs)
+/checkpoints/
+/outputs/
+/logs/
+
+# Stray artifacts in root (legacy, should not exist)
 *.safetensors
 *.bin
 *.ckpt
-
-# Training outputs
 gallery_*.txt
 full_pipeline_*.txt
+diagnostic_*.txt
+training_*.txt
 
 # Data artifacts (keep brain_corpus.json, exclude generated)
 data/*.txt

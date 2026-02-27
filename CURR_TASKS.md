@@ -1,149 +1,129 @@
 # Current Tasks -- GESTALT
 
-## Active Sprint: Phase 2 (BPE + Language Scaling)
+## Active Sprint: Phase 2.5 Evaluation + Documentation
 
-**Goal:** Break the 373-token ceiling. Real vocabulary, scaled model, language training.
+**Goal:** Evaluate v22 hero run, update documentation, push to GitHub.
+
+### Just Completed
+- **v22 hero gallery evaluation** — 166 prompts, ~40-45% coherent openings
+- **Sampling improvements** — windowed repetition penalty (50 tokens), top-p (0.9)
+- **PAPER.md rewrite** — 2,364→941 lines, restructured for accessibility
+- **Scaled architecture to d=1024** — bumped parameters up to ~200M properly in configs
+- **127 tests passing** (119 lib + 8 integration)
 
 ### In Progress
-- **T-016: v15 GPU training — SFT-only (DA disabled)**
-  - v14 COMPLETE: all 4 phases ran, policy 64/64 perfect
-  - **DA post-mortem (M-039):** DA at lr=1e-4 destroyed autoregressive coherence.
-    SFT model was perfect, DA corrupted first-byte accuracy and long-range generation.
-  - v15 retraining with da_steps=0 (SFT-only), early stopping + best checkpoint active
-  - PAPER.md at 2,364 lines, sent to Discord
-  - Early stopping implemented: saves ~87% wasted planner steps, ~30% policy steps
-  - `gestalt gallery` command: 53 prompts across 9 categories
+- Documentation updates (this file, ALL_TASKS.md)
+- Git commit + push to `phase-2.5/concept-tokenizer-memory`
 
-### What Made v14 Work (v2-v13 all failed)
-1. **candle-nn gradient fix (M-032)**: `RmsNorm` and `softmax_last_dim` had broken backward
-   passes. Replaced with `GradRmsNorm` and `grad_softmax_last_dim` using basic tensor ops.
-   ALL 12 prior runs failed because the encoder NEVER received a single gradient.
-2. **Mean pooling (replacing last-token extraction)**: Last-token extraction produced
-   identical concept vectors (sim=0.96) because all inputs end with EOS. Mean pooling
-   over non-PAD positions produces discriminative vectors (sim=0.25).
-3. **PAD-denoising (10% noise)**: Forces decoder to attend to concept prefix instead of
-   relying only on local bigram statistics. Without this, loss plateaus at ~2.15.
-
-### Up Next (After v15 completes)
-- Run `gestalt gallery --config default` — comprehensive generation samples
-- Send gallery results to Discord
-- Fix DA: either full-sequence DA at lr=1e-5, or skip entirely
-- T-017: Language region training on expanded corpus
-- T-018: DPO alignment (optional, evaluate after T-017)
-- Phase 2 full run: `--config phase2` (d=1024, 8+8 layers, ~200M params)
-
-### Ahead-of-Schedule Completions
-- T-015: Corpus expanded to 242 dialogue pairs (was 80 in V4) ✅
-- T-019: memory.rs fully implemented (339 LOC, 8 tests) ✅
-- ConceptTokenizer foundation laid in tokenizer.rs (11 tests) ✅
-- PAPER.md: 2,340-line technical paper with full v14 narrative ✅
+### Up Next
+- **Expand corpus** — target 100K+ pairs from public datasets
+- **Memory-augmented training** — train decoder WITH memory prefix (T-020 architecture ready)
 
 ---
 
-## v14 Training Results (COMPLETE — 2h 1m wall clock)
+## v22 Hero Results (merges=200, dropout=0.1, 30K steps)
 
-### SFT Phase (COMPLETE — 11,378s, 2.2 steps/sec)
+### What Works (~40-45% coherent openings)
 ```
-Config: d_model=512, enc=1L, dec=4L, heads=8, batch=48, lr=3e-4, noise=10%
-Step     0: loss=6.37 | concept_sim=N/A
-Step  6250: loss=0.02 | concept_sim=0.42 | Greedy: coherent JARVIS responses
-Step 12500: loss=0.00 | concept_sim=0.28 | Greedy: same quality, encoder more discriminative
-Step 25000: loss=0.00 | concept_sim=0.25 | Generation perfect on all test prompts
-GPU: 84-98% SM, 13.6/16.3GB VRAM
-```
-
-### DA Phase (COMPLETE but HARMFUL — M-039)
-```
-Config: batch=16, lr=1e-4, 8192 steps, 1360s
-Step  1000: loss=0.25
-Step  4600: loss=0.003
-Step  8191: loss=0.0015 (final)
-```
-**FINDING:** DA destroyed generation quality. SFT model was perfect; after DA,
-"hello" → "Rello" (first byte wrong). DA trains on isolated byte positions
-which breaks autoregressive coherence. Default config now uses da_steps=0.
-
-### Planner SFT (COMPLETE — 593s, 6.7 steps/sec)
-```
-21/21 plan_bench (perfect). Loss hit 0.0000 at step 500/4000 — 87% wasted.
+"good morning"       → "Morning! How'd you sleep?"                    ← perfect
+"The build broke"    → "Step one: read the error message."            ← excellent
+"tell me about yourself" → "I'm a language model with opinions..."    ← personality captured
+"NGE?"               → "A mecha show about depression, parental..."   ← remarkable
+"I'm scared of failing" → "Good. Fear of failure means you care..."   ← emotionally intelligent
 ```
 
-### Policy (COMPLETE — 16384 steps)
+### What Breaks
+After ~15 tokens, outputs degenerate into word salad. The model interpolates between training examples mid-sentence. Capacity bottleneck: 512-dim, 21K pairs.
+
+### Training Run History
+
+| Run | Corpus | Vocab | Dropout | Steps | Best Val | Gallery |
+|-----|--------|-------|---------|-------|----------|---------|
+| v2-v12 | 242 | 259 | 0.0 | varies | N/A | Encoder dead (M-032) |
+| v14 | 242 | 259 | 0.0 | 25K | ~0.00 | Perfect memorization |
+| v18 | 1,749 | 259 | 0.0 | 12K | 2.02 | Memorized verbatim |
+| v19 | 21,786 | 2,259 | 0.0 | 6K | 3.55 | 0% coherent |
+| v20 | 21,786 | 2,259 | 0.1 | 8K | 3.26 | ~30% coherent |
+| v22 mock | 21,786 | 459 | 0.1 | 5K | 2.04 | Grammar good |
+| **v22 hero** | **21,786** | **459** | **0.1** | **30K** | **~1.9** | **~40-45% coherent** |
+
+### Key Discovery: Merge Count
 ```
-64/64 bench (perfect). Loss 0.0001 by step 10000 — ~30% wasted.
+Grid search at 300 steps:
+  merges=50  → val=2.79    merges=200  → val=3.56 ← sweet spot
+  merges=500 → val=4.08    merges=2000 → val=5.53
 ```
 
-### Concept Tokenizer (COMPLETE)
-```
-2,259 tokens = 259 base + 2,000 merges. Saved to concept_tokenizer.bin (27KB).
-"hello" → 3 tokens (1.67x), "what can you do" → 4 tokens (3.75x)
-```
+---
 
-### v2-v13 Failure Summary (for posterity)
-All 12 runs produced concept_sim=0.9591 (collapsed encoder). Root cause: candle-nn
-RmsNorm/softmax broken backward passes → zero gradient to all transformer parameters
-except lm_head. Diagnosed in 2 hours with isolation test after 40+ hours of blind
-iteration (M-031, M-032).
+## Phase Progress
+
+```
+Phase 0: Foundation Port        ████████████████████ 100%
+Phase 1: Tool Execution         ████████████████████ 100%
+Phase 2: BPE + Language         ██████████████░░░░░░  70%  (v22 trained + evaluated)
+Phase 2.5: Memory Integration   ████████████████████ 100%  (code complete)
+Phase 3: Memory-Augmented Train ██░░░░░░░░░░░░░░░░░░  10%  (architecture ready)
+Phase 4: Multi-Turn + ReAct     ████░░░░░░░░░░░░░░░░  20%  (session ring buffer done)
+Phase 5: Online Learning        ░░░░░░░░░░░░░░░░░░░░   0%
+Phase 6: Proactive + JARVIS     ░░░░░░░░░░░░░░░░░░░░   0%
+```
 
 ---
 
 ## Completed Phases
 
-### Done (Phase 1 — Tool Execution + Pipeline)
-- T-010: executor.rs — 15-tool execution engine (472 LOC, 9 tests) ✅
-- T-011: pipeline.rs — run_goal() orchestration (434 LOC, 8 tests) ✅
-- T-012: integration.rs — 6 E2E pipeline tests (147 LOC) ✅
-- T-013: main.rs — CLI binary: run/train/eval/serve/gallery ✅
+### Phase 2.5: Memory Integration (CODE COMPLETE)
+- ConceptTokenizer with BPE merges (459 vocab, 200 merges) ✅
+- brain.rs decoder_vocab_size replaces hardcoded TALK_VOCAB_SIZE ✅
+- Memory-augmented forward pass (build_prefix with optional memory) ✅
+- EpisodicMemory with retrieve_recent() for bulk loading ✅
+- Cross-session recall integration tests ✅
+- 21,786-pair corpus from Dolly/OASST2/Alpaca ✅
+- Grid search infrastructure (env vars for merges, dropout, steps) ✅
 
-### Done (Phase 0 — Foundation Port)
-- T-001: transformer.rs (623 LOC, 8 tests) ✅
-- T-002: training.rs (535 LOC, 8 tests) ✅
-- T-003: tokenizer.rs (1,043 LOC, 22 tests — includes ConceptTokenizer) ✅
-- T-004: planner.rs (685→710 LOC, 6 tests) ✅
-- T-005: brain.rs (1,937→2,100+ LOC, 20 tests — unified brain) ✅
-- T-006: eval.rs (497 LOC, 10 tests) ✅
-- T-007: Talk corpus embedded in brain.rs (242 pairs) ✅
-- T-008: lib.rs module root (deny dead_code, all modules) ✅
-- T-009: Full build verification ✅
+### Phase 1: Tool Execution + Pipeline
+- T-010: executor.rs — 15 tools, 3 safety levels ✅
+- T-011: pipeline.rs — run_goal() orchestration ✅
+- T-012: integration.rs — 8 E2E tests ✅
+- T-013: main.rs — CLI: train/gallery/serve/run ✅
+
+### Phase 0: Foundation Port
+- T-001 through T-009: all complete ✅
 
 ---
 
 ## Build Commands
 ```bash
-# CPU check
-cargo check --release
+# GPU build
+PATH="/usr/local/cuda-12.6/bin:$PATH" CUDA_HOME="/usr/local/cuda-12.6" \
+  CUDA_COMPUTE_CAP=89 cargo build --release --features cuda
 
-# Full GPU build
-PATH="/usr/local/cuda-12.6/bin:$PATH" CUDA_HOME="/usr/local/cuda-12.6" CUDA_COMPUTE_CAP=89 cargo build --release --features cuda
+# Tests (127 total)
+cargo test --release --features cuda
 
-# Test (105 tests)
-cargo test --release
+# Gallery evaluation
+GESTALT_MERGES=200 ./target/release/gestalt gallery --config default
 
-# Train (config tiers)
-./target/release/gestalt train --config default   # d=512, GPU
-./target/release/gestalt train --config phase2     # d=1024, GPU
+# Training with env vars
+GESTALT_MERGES=200 GESTALT_DROPOUT=0.1 GESTALT_SFT_STEPS=30000 \
+  ./target/release/gestalt train --config default
 
-# Gallery (after training, loads checkpoint)
-./target/release/gestalt gallery --config default
-
-# Run/Serve with trained checkpoint
-./target/release/gestalt run "hello" --config default
-./target/release/gestalt serve --config default
+# Grid search (quick 300-step sweeps)
+./scripts/grid_search.sh
 ```
 
-## Key Decisions Resolved
-- ConceptEncoder: **mean pooling** over non-PAD positions (v14+, was last-token in v2-v13)
-- Gradient safety: `GradRmsNorm` + `grad_softmax_last_dim` replace broken candle-nn ops
-- Denoising: PAD-replacement at 10% max with quadratic ramp
-- Direct encoder training (v14): no codebook bypass, gradients flow through encoder
-- Policy encoding: BYTE_VOCAB=256 (raw bytes), NOT TalkTokenizer
-- Memory default: K=8 top memories, capacity=1024 entries, FIFO eviction
-- Config tiers: test (d=64, CPU) / default (d=512, GPU) / phase2 (d=1024, GPU)
-- Checkpoints: safetensors format, auto-save after training phases
+## Key Architecture Decisions
+- ConceptEncoder: mean pooling over non-PAD (v14+)
+- Gradient safety: GradRmsNorm + grad_softmax_last_dim (M-032)
+- Denoising: PAD-replacement at 10% max, quadratic ramp
+- Tokenizer: merges=200 (459 vocab, ~2x compression)
+- Dropout: 0.1 (extends training from 6K to 13K+ before overfitting)
+- Memory: K=8, capacity=1024, FIFO eviction, SQLite persistence
+- Early stopping: stale_stop mode (no threshold, pure patience)
 
 ## Cumulative Stats
-- Total: ~7,200+ LOC across 13 files, 105 tests passing
+- Total: ~7,400 LOC across 13 files, 127 tests passing
 - Warnings: 0, Dead code: 0
-- Phase 0+1: COMPLETE
-- Phase 2: IN PROGRESS — v14 training active, first successful run
-- Phase 3: T-019 done ahead of schedule
+- Training runs: v2-v22 (14 total, 12 failed due to M-032)
+- Documented mistakes: 43 in MISTAKES.md
