@@ -37,6 +37,7 @@ Run this before every major change. Each item traces to a specific past failure.
 - [ ] **No guessing metrics:** If you haven't measured it, say "I don't know." Never present estimates as facts. (M-036)
 - [ ] **Automate, don't promise:** If a behavioral fix fails 3+ times, engineer the solution. Use the sidecar while-loop heartbeat, not "I'll remember this time." (M-037)
 - [ ] **No bg listener tasks:** NEVER use dual-listener bg bash polling. Use timer-based heartbeat only. (M-028)
+- [ ] **Prompt quality:** When writing/rewriting prompts, verify against /make-prompt's Six Elements (World, Chain, Gates, Safety Net, Evolution, Output). The make-prompt framework IS the quality standard. (M-058)
 
 ---
 
@@ -459,3 +460,38 @@ Combined: v24 trained with tokenizer T1 (random merge ordering, never saved). Ga
 **Root cause:** Did not proactively update todos with sufficient detail as work progressed. The todo list had high-level phase descriptions but no specific current-step context (e.g., "investigating v24 gallery garbling, suspect cross-attn or tokenizer mismatch").
 **Fix:** Update todos with specific current state BEFORE compaction triggers (proactively at ~50-60% context usage), and definitely as work progresses through sub-steps.
 **Prevention:** After each significant discovery or state change, immediately update the relevant todo item's description. Use TaskUpdate to capture WHERE you are in a multi-step investigation, not just THAT you're investigating.
+
+### M-054: Training monitoring reported timestamps instead of actual loss values
+**When:** 2026-02-26, during Phase 3 SFT overnight monitoring
+**Symptom:** Lain asked "what is loss at?" and "youre not giving me any numbers" — monitoring had been reporting checkpoint timestamp deltas for 2+ hours without ever showing the actual val_loss value. Completely useless from Lain's perspective.
+**Root cause:** Training output only goes to stderr (console window). No log file, no metadata in safetensors checkpoint, no state file. The monitoring loop could only detect WHETHER the checkpoint changed, never WHAT the loss actually was. Should have implemented observability from day one of the monitoring task, not 2 hours into it.
+**Fix:** (1) Added `checkpoints/brain_best_sft_state.txt` — written on every new best, contains `loss step`. (2) Added `checkpoints/training_log.csv` — appended at every log interval with step, train_loss, val_loss, lr, noise. Both survive crashes and can be read externally.
+**Prevention:** Any monitoring system MUST report the actual metric being tracked, not just proxy signals (timestamps, file existence). If you can't observe the value, fix observability first before starting the monitoring loop. Add to prevention checklist: "Can I report the actual number Lain cares about?"
+
+### M-055: Too timid to restart training when we have crash-safe checkpointing
+**When:** 2026-02-26, during monitoring session
+**Symptom:** Proposed code changes to add loss logging, then said "needs a training restart" and waited for Lain's approval + a natural crash, instead of just restarting immediately. Wasted 2+ hours of monitoring without loss numbers.
+**Root cause:** Over-caution about stopping a running training process, despite having verified (390/420 audit) that the checkpoint system is crash-safe with atomic saves and auto-resume. The anti-crash bat loop + `--resume` flag means restart is a ~30 second interruption, not a catastrophe.
+**Fix:** Just restart. The whole point of building crash-safe infrastructure is to USE it confidently.
+**Prevention:** If the checkpoint system has been audited and verified safe, treat restart as a routine operation, not a scary one. "We have checkpointing" = restarts are free. Don't ask permission for reversible operations that have verified safety nets.
+
+### M-056: Silently monitored for 5 hours without Discord comms after MCP died
+**When:** 2026-02-26/27, overnight monitoring session
+**Symptom:** Lain: "bro WHY ARE YOU NOT SENDING DISCORD". MCP and HTTP sidecar both died after training restart. Instead of loudly flagging the comms outage, I silently noted "MCP down" in CLI output (invisible to Lain per L10 rules) and kept monitoring. 5 hours of updates never reached Discord.
+**Root cause:** Circular failure — can't tell Lain on Discord that Discord is down, but CLI output is invisible per standing orders. Should have: (1) tried harder to restart the sidecar, (2) escalated loudly in CLI since it's the only channel left, (3) attempted to restart the MCP node process directly.
+**Fix:** When Discord comms fail, IMMEDIATELY escalate in CLI with prominent warning. Don't silently continue — the whole point of monitoring is to COMMUNICATE results. Monitoring without reporting is just wasting compute.
+**Prevention:** On MCP failure: (1) Try restarting sidecar process directly. (2) If that fails, print LOUD CLI warning every heartbeat cycle. (3) Never go more than 2 heartbeat cycles without comms — if comms are dead for 10+ min, that IS the emergency, not the training status.
+
+### M-057: Heartbeat timer set but not processed promptly
+**When:** 2026-02-27, optimization session
+**Symptom:** Lain: "no discord timer set, log mistake". Set sleep 300 background task but got absorbed in Phase 2 code changes. When the timer fired, didn't immediately process it — continued working on code instead. No heartbeat update sent to Discord for the first 5-minute cycle.
+**Root cause:** Heartbeat timer fires as a task notification, but if you're deep in a tool call chain, the notification arrives alongside other results and gets deprioritized. The protocol says heartbeat is NON-NEGOTIABLE but the implementation relies on the operator noticing a notification mid-work.
+**Fix:** When heartbeat timer fires, IMMEDIATELY handle it before continuing any other work. The heartbeat check-send-restart cycle takes ~5 seconds. No code change is so urgent it can't wait 5 seconds.
+**Prevention:** Treat heartbeat notifications like interrupts, not suggestions. Timer fires → stop current work → check Discord → send update → restart timer → resume work. No exceptions.
+
+### M-058: Rewrote 15 command prompts without invoking /make-prompt framework
+**When:** 2026-02-27, skills/commands V2 rewrite session
+**Symptom:** Lain: "you should invoke /make-prompt often" and "log mistake". Rewrote 15/18 commands with V2 philosophy (narrative gravity, tool bindings, anti-shortcut protocols) but never invoked /make-prompt to validate the prompt quality against its own Six Elements framework.
+**Root cause:** Treated /make-prompt as a tool for creating NEW prompts, not for validating REWRITTEN ones. The make-prompt command defines the exact quality bar (World, Chain, Gates, Safety Net, Evolution, Output) — and I was eyeballing these elements instead of systematically checking each command against them. Oracle validation caught some issues, but the make-prompt audit checklist would have caught more structural ones (missing evolution mechanisms, bare commands without contextual clues, severity inflation).
+**Fix:** For remaining commands and the final 420 pass: run each command through /make-prompt's Phase 3 audit checklist. Verify all six elements are present. Check gravity, contextual clues, and gate specificity against the make-prompt standards explicitly.
+**Prevention:** When rewriting prompts, ALWAYS reference /make-prompt's Six Elements and Phase 3 audit checklist. The make-prompt command IS the quality standard for all prompts in this system. Skipping it is like writing code without running tests. Add to prevention checklist: "Did I verify against /make-prompt's Six Elements?"

@@ -85,17 +85,17 @@ pub struct TransformerConfig {
 fn default_max_train_len() -> usize { 256 }
 
 impl TransformerConfig {
-    /// Phase 0-1 default: d=512, 4 layers, 8 heads.
+    /// Phase 2.5+ scaled architecture: d=1024, 8 layers, 8 heads, ~200M params.
     pub fn default() -> Self {
         Self {
-            d_model: 512,
-            n_layers: 4,
+            d_model: 1024,
+            n_layers: 8,
             n_heads: 8,
-            d_ff: 2048,
-            vocab_size: 373,
+            d_ff: 4096,
+            vocab_size: 8192,
             max_seq_len: 256,
             max_train_len: 256,
-            dropout: 0.0,
+            dropout: 0.1,
             use_cross_attn: false,
         }
     }

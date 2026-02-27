@@ -478,6 +478,9 @@ pub struct ConceptTokenizer {
     id_to_bytes: HashMap<u32, Vec<u8>>,
     /// Total vocab size = 259 + number of merges.
     total_vocab: usize,
+    /// First-byte index: merge_index[byte] = indices into self.merges for rules starting with that byte.
+    /// Avoids linear scan of all merges during encoding.
+    merge_index: Vec<Vec<usize>>,
 }
 
 impl ConceptTokenizer {
@@ -487,6 +490,7 @@ impl ConceptTokenizer {
             merges: Vec::new(),
             id_to_bytes: HashMap::new(),
             total_vocab: CONCEPT_BASE_VOCAB,
+            merge_index: vec![Vec::new(); 256],
         }
     }
 
@@ -500,10 +504,18 @@ impl ConceptTokenizer {
         // Sort merges by pattern length descending for greedy longest-match.
         let mut sorted = merges;
         sorted.sort_by(|a, b| b.pattern.len().cmp(&a.pattern.len()));
+        // Build first-byte index for O(1) lookup during encoding.
+        let mut merge_index = vec![Vec::new(); 256];
+        for (i, rule) in sorted.iter().enumerate() {
+            if let Some(&first) = rule.pattern.first() {
+                merge_index[first as usize].push(i);
+            }
+        }
         Self {
             merges: sorted,
             id_to_bytes,
             total_vocab,
+            merge_index,
         }
     }
 
@@ -527,8 +539,9 @@ impl ConceptTokenizer {
         let mut i = 0;
         while i < bytes.len() {
             let mut matched = false;
-            // Try longest merge first (merges are pre-sorted by pattern length desc).
-            for rule in &self.merges {
+            // Use first-byte index to only check relevant merges (longest-first order preserved).
+            for &idx in &self.merge_index[bytes[i] as usize] {
+                let rule = &self.merges[idx];
                 let plen = rule.pattern.len();
                 if i + plen <= bytes.len() && bytes[i..i + plen] == rule.pattern[..] {
                     ids.push(rule.token_id);

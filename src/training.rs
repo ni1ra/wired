@@ -51,6 +51,10 @@ impl CosineScheduler {
     pub fn current_step(&self) -> usize {
         self.current_step
     }
+
+    pub fn set_step(&mut self, step: usize) {
+        self.current_step = step;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -124,6 +128,21 @@ impl Trainer {
             step_count: 0,
             timer_start: Instant::now(),
         })
+    }
+
+    /// Resume training from a given step. Sets both the step counter and scheduler
+    /// position so the LR schedule continues from where it left off.
+    /// Note: optimizer momentum (AdamW m/v) is NOT restored — it rebuilds naturally
+    /// in ~1K steps. This is acceptable for the minimal resume fix.
+    pub fn resume_from_step(&mut self, step: usize) {
+        self.step_count = step;
+        self.scheduler.set_step(step);
+        let lr = self.scheduler.get_lr();
+        self.optimizer.set_learning_rate(lr);
+        eprintln!(
+            "[RESUME] Restored trainer to step {}, lr={:.2e}",
+            step, lr
+        );
     }
 
     /// Accumulate gradients from a micro-batch loss. Properly accumulates gradient
@@ -273,6 +292,10 @@ impl EarlyStopping {
                     eprintln!("[BEST] Warning: failed to save best checkpoint: {e}");
                 } else {
                     eprintln!("[BEST] New best loss={avg_loss:.6} at step {step} -> {path}");
+                    // Write machine-readable state file for external monitoring
+                    let state_path = path.replace(".safetensors", "_state.txt");
+                    let _ = std::fs::write(&state_path,
+                        format!("{avg_loss:.6} {step}\n"));
                 }
             }
             action = EarlyStopAction::NewBest;
@@ -380,7 +403,7 @@ pub fn one_hot_tensor(indices: &Tensor, num_classes: usize, device: &Device) -> 
 
 pub fn save_checkpoint(varmap: &VarMap, path: &str) -> Result<()> {
     let tensors = varmap.all_vars();
-    let data = varmap.data().lock().unwrap();
+    let data = varmap.data().lock().expect("VarMap mutex poisoned");
     let named: std::collections::HashMap<String, Tensor> = data
         .iter()
         .map(|(name, var)| (name.clone(), var.as_tensor().clone()))
@@ -392,7 +415,7 @@ pub fn save_checkpoint(varmap: &VarMap, path: &str) -> Result<()> {
 
 pub fn load_checkpoint(varmap: &VarMap, path: &str, device: &Device) -> Result<()> {
     let tensors = candle_core::safetensors::load(path, device)?;
-    let data = varmap.data().lock().unwrap();
+    let data = varmap.data().lock().expect("VarMap mutex poisoned");
     let mut loaded = 0usize;
     for (name, var) in data.iter() {
         if let Some(saved_tensor) = tensors.get(name) {

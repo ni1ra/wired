@@ -10,7 +10,7 @@
 // GPU: auto-detected when compiled with --features cuda and tier is not "test"
 
 use gestalt::brain::{
-    Brain, BrainConfig, PolicyConfig, TalkTokenizer,
+    Brain, BrainConfig, PolicyConfig,
     train_brain_talk, brain_generate, brain_diagnostic_decode, train_and_bench,
     bootstrap_concept_tokenizer, build_concept_tokenizer,
 };
@@ -311,33 +311,16 @@ fn cmd_train(tier: ConfigTier, resume: bool) -> anyhow::Result<()> {
     }
 
     let temperature = config.temperature;
-    let (brain, _brain_varmap) = if resume {
-        // Resume: load brain from best SFT checkpoint, skip training
-        let ckpt = "checkpoints/brain_best_sft.safetensors";
-        eprintln!("\n[GESTALT] === Resuming from {} ===", ckpt);
-        anyhow::ensure!(std::path::Path::new(ckpt).exists(),
-            "Cannot resume: {} not found", ckpt);
-        // v17: set decoder_vocab_size for model construction
-        let mut resume_config = config.clone();
-        resume_config.decoder_vocab_size = decoder_tok.vocab_size();
-        let varmap = VarMap::new();
-        let brain = Brain::new(resume_config, &policy_cfg, &varmap, &device)?;
-        load_checkpoint(&varmap, ckpt, &device)?;
-        eprintln!("[GESTALT] Brain loaded from checkpoint");
-        (brain, varmap)
-    } else {
-        // Phase 1: Brain (SFT + dialogue-aligned finetuning)
-        eprintln!("\n[GESTALT] === Training brain (SFT + DA) ===");
-        let (brain, brain_varmap, losses) = train_brain_talk(&config, &policy_cfg, &decoder_tok, &device)?;
-        let final_loss = losses.last().copied().unwrap_or(f32::NAN);
-        eprintln!("[GESTALT] Brain done. Final loss: {:.4}", final_loss);
+    // Phase 1: Brain (SFT + dialogue-aligned finetuning)
+    eprintln!("\n[GESTALT] === Training brain (SFT + DA) ===");
+    let (brain, brain_varmap, losses) = train_brain_talk(&config, &policy_cfg, &decoder_tok, &device, resume)?;
+    let final_loss = losses.last().copied().unwrap_or(f32::NAN);
+    eprintln!("[GESTALT] Brain done. Final loss: {:.4}", final_loss);
 
-        // Save brain checkpoint
-        if tier != ConfigTier::Test {
-            save_checkpoint(&brain_varmap, "checkpoints/brain_checkpoint.safetensors")?;
-        }
-        (brain, brain_varmap)
-    };
+    // Save brain checkpoint
+    if tier != ConfigTier::Test {
+        save_checkpoint(&brain_varmap, "checkpoints/brain_checkpoint.safetensors")?;
+    }
 
     // Save concept tokenizer BEFORE any early exit (M-052: BRAIN_ONLY was skipping this)
     if tier != ConfigTier::Test {
@@ -351,7 +334,7 @@ fn cmd_train(tier: ConfigTier, resume: bool) -> anyhow::Result<()> {
         if !std::env::var("GESTALT_BRAIN_ONLY").is_ok() {
             eprintln!("\n[GESTALT] === Bootstrapping concept tokenizer from encoder (T-014, diagnostic) ===");
             let max_merges = if tier == ConfigTier::Phase2 { 8000 } else { 500 };
-            let _encoder_tok = bootstrap_concept_tokenizer(&brain, max_merges, 3, &device)?;
+            let _encoder_tok = bootstrap_concept_tokenizer(&brain, max_merges, 3, &device, &decoder_tok)?;
         }
     }
 
@@ -740,7 +723,7 @@ fn cmd_diagnose(tier: ConfigTier) -> anyhow::Result<()> {
         anyhow::bail!("No checkpoint at {}. Run 'gestalt train' first.", ckpt);
     }
 
-    let enc_tok = TalkTokenizer;
+    let enc_tok = &decoder_tok;
     let enc_seq = diag_config.encoder_seq_len;
     let dec_seq = diag_config.decoder_seq_len;
 
@@ -877,7 +860,7 @@ fn cmd_diagnose(tier: ConfigTier) -> anyhow::Result<()> {
                 .enumerate()
                 .map(|(i, &l)| (i, l))
                 .collect();
-            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
             let predicted_id = indexed[0].0 as u32;
             let in_top5 = indexed.iter().take(5).any(|(id, _)| *id as u32 == target_id);
@@ -954,7 +937,7 @@ fn cmd_diagnose(tier: ConfigTier) -> anyhow::Result<()> {
 
             // Greedy token
             let best_id = probs.iter().enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(i, _)| i as u32).unwrap_or(2); // EOS
 
             entropies.push(entropy);
@@ -1128,7 +1111,7 @@ fn cmd_serve(tier: ConfigTier) -> anyhow::Result<()> {
                 println!("\nJARVIS: {}", response);
 
                 // Persist to episodic memory
-                let enc_tok = TalkTokenizer;
+                let enc_tok = decoder_tok.clone();
                 let goal_ids = enc_tok.encode(trimmed);
                 let goal_padded = enc_tok.pad_or_truncate(&goal_ids, config.encoder_seq_len);
                 if let Ok(goal_tensor) = Tensor::from_vec(

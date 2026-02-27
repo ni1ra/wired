@@ -331,7 +331,7 @@ impl ReactLoop {
 
                     // Check if this is a pure conversational response (no tool needed)
                     // Classify to see if brain wants to talk or use a tool
-                    let (_, actions) = classify_goal(brain, goal, device)?;
+                    let (_, actions) = classify_goal(brain, goal, decoder_tok, device)?;
                     let first_action = actions[0];
 
                     if first_action == ACT_TALK || first_action == ACT_END {
@@ -350,7 +350,7 @@ impl ReactLoop {
 
                 ReActPhase::Act => {
                     // Execute the classified action
-                    let (_, actions) = classify_goal(brain, goal, device)?;
+                    let (_, actions) = classify_goal(brain, goal, decoder_tok, device)?;
                     let action = actions[0];
                     let name = action_name(action);
 
@@ -367,7 +367,16 @@ impl ReactLoop {
 
                     match tool_args {
                         Some(args) => {
-                            match executor.run(&args) {
+                            let encoder = |text: &str| -> anyhow::Result<std::vec::Vec<f32>> {
+                                let ids = decoder_tok.encode(text);
+                                let seq_len = brain.config.encoder_seq_len;
+                                let padded = decoder_tok.pad_or_truncate(&ids, seq_len);
+                                let goal_t = candle_core::Tensor::from_vec(padded, (1, seq_len), device)?;
+                                let concept_vec = brain.encode_concept(&goal_t)?;
+                                Ok(concept_vec.squeeze(0)?.to_vec1::<f32>()?)
+                            };
+
+                            match executor.run(&args, None, Some(&encoder)) {
                                 Ok(output) => {
                                     let stdout = output.stdout.clone();
                                     tool_outputs.push(output);

@@ -123,7 +123,7 @@ fn test_full_pipeline_hello() {
 fn test_full_pipeline_classify() {
     // Verify classify_goal returns valid intent and actions
     let (brain, _dtok, device) = create_test_brain();
-    let (intent, actions) = classify_goal(&brain, "run cargo test", &device).unwrap();
+    let (intent, actions) = classify_goal(&brain, "run cargo test", &_dtok, &device).unwrap();
     assert!(intent < NUM_INTENTS);
     for (i, &a) in actions.iter().enumerate() {
         assert!(a < 16, "Action {} at step {} out of range", a, i);

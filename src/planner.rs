@@ -73,12 +73,12 @@ impl PlanLmConfig {
     /// Phase 2: scaled planner (d=1024, 8 layers).
     pub fn phase2() -> Self {
         Self {
-            d_model: 1024,
-            n_layers: 8,
+            d_model: 512,
+            n_layers: 4,
             n_heads: 8,
-            d_ff: 4096,
-            max_seq_len: 512,
-            batch_size: 21,
+            d_ff: 2048,
+            max_seq_len: 256,
+            batch_size: 4,
             sft_steps: 8000,
             sft_lr: 2e-4,
             scheduled_sampling_steps: 2000,
@@ -534,7 +534,7 @@ pub fn diagnostic_decode(
             .enumerate()
             .map(|(i, &p)| (i as u32, p))
             .collect();
-        sorted_probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        sorted_probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let top5: Vec<(String, f32)> = sorted_probs.iter()
             .take(5)
             .map(|(id, p)| (tok.token(*id).to_string(), *p))

@@ -305,7 +305,7 @@ Break the 373-token ceiling. Real vocabulary for real text.
   - **Accept:** Pipeline produces tokenized sequences on disk. Token distribution is reasonable.
 
 ### 2.3 Scale Transformer
-- [ ] **T-016** Update `src/transformer.rs` configs — scale to d=1024, 8+8 layers
+- [x] **T-016** Update `src/transformer.rs` configs — scale to d=1024, 8+8 layers
   - New config: d=1024, 8 layers, 8 heads, d_ff=4096, vocab=8192
   - ~200M parameters
   - Fits in ~800MB VRAM at fp32

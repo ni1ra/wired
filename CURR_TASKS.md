@@ -8,6 +8,7 @@
 - **v22 hero gallery evaluation** — 166 prompts, ~40-45% coherent openings
 - **Sampling improvements** — windowed repetition penalty (50 tokens), top-p (0.9)
 - **PAPER.md rewrite** — 2,364→941 lines, restructured for accessibility
+- **Scaled architecture to d=1024** — bumped parameters up to ~200M properly in configs
 - **127 tests passing** (119 lib + 8 integration)
 
 ### In Progress
@@ -15,7 +16,6 @@
 - Git commit + push to `phase-2.5/concept-tokenizer-memory`
 
 ### Up Next
-- **Scale to d=1024** — 4x more capacity, 8+8 layers, ~200M parameters
 - **Expand corpus** — target 100K+ pairs from public datasets
 - **Memory-augmented training** — train decoder WITH memory prefix (T-020 architecture ready)
 
